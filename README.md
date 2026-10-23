@@ -1,0 +1,236 @@
+# 📈 StockView
+
+**StockView** is a **desktop web application** for real-time stock market analysis. It combines interactive data visualization, anomaly detection, news sentiment insights, and machine learning–based price predictions into a single dashboard.
+
+🚀 **Live Deployment**:
+
+* **Frontend (Vercel)** → [View App](https://stock-view-ebon.vercel.app/)
+* **Backend (Render)** → See `DEPLOYMENT_COMPLETE_GUIDE.md` for deployment instructions
+
+---
+
+## ✨ Features
+
+* **Real-time Stock Data** → Current price, open, high, low, and volume.
+* **Interactive Charts** → Zoom/pan with SMA, anomaly highlights, and prediction overlays.
+* **Technical Indicators** → SMA, RSI, MACD, Bollinger Bands, ATR, and more.
+* **Anomaly Detection** → Detects unusual price movements via Z-score.
+* **Machine Learning Predictions** →
+
+  * Algorithms: Linear Regression, Random Forest, XGBoost, LightGBM, CNN.
+  * Metrics: R², MAE, RMSE, MAPE.
+  * Algorithm comparison dashboard.
+  * **Model evaluation framework** → Chronological backtesting across multiple symbols with automated reports and charts.
+* **News & Sentiment Analysis** → Headlines with Positive/Neutral/Negative labels and sentiment charts.
+* **Watchlist** → Add/remove stock symbols, synced with Firebase.
+
+---
+
+## 🏗️ Tech Stack
+
+### Frontend (React + Vite)
+
+* React + Hooks for state management
+* Recharts for interactive visualization
+* TailwindCSS for UI styling
+* Firebase (Cloud Firestore) for watchlist persistence
+
+### Backend (FastAPI)
+
+* FastAPI for REST API
+* Yahoo Finance (`yfinance`) for stock data
+* VADER Sentiment Analyzer for news sentiment
+* ML Models: scikit-learn, XGBoost, LightGBM, TensorFlow (CNN)
+* Technical indicators with `ta` library
+* Matplotlib for evaluation visualizations
+
+---
+
+## 📊 Model Evaluation Framework
+
+StockView includes a reproducible backtesting pipeline in `backend/evaluation.py` that benchmarks all five forecasting models on historical data.
+
+### What it does
+
+* Downloads OHLCV data via **yfinance** (same pipeline as the live API)
+* Applies **chronological 80/20 train/test split** (no random shuffling — avoids look-ahead bias)
+* Reuses shared modules (`features.py`, `models/training.py`) used by the live API
+* Computes **MAE**, **RMSE**, **MAPE**, and **R²** on the held-out test set
+* Exports results to CSV, a summary report, and comparison charts
+
+### Models evaluated
+
+| Model | Description |
+|-------|-------------|
+| Linear Regression | Time-index trend baseline |
+| Random Forest | Ensemble on 21 engineered features |
+| XGBoost | Gradient boosting on engineered features |
+| LightGBM | Light gradient boosting on engineered features |
+| CNN | 1D convolutional network on raw Close price sequences |
+
+### Benchmark results (5 symbols, 1y daily data)
+
+Evaluated on **AAPL, MSFT, TSLA, GOOGL, AMZN** with an 80/20 chronological split:
+
+| Model | Avg MAE | Avg RMSE | Avg MAPE | Avg R² |
+|-------|---------|----------|----------|--------|
+| Random Forest | $17.60 | $20.65 | 5.13% | -1.02 |
+| LightGBM | $17.49 | $20.34 | 5.17% | -1.11 |
+| XGBoost | $17.68 | $20.67 | 5.21% | -1.14 |
+| Linear Regression | $30.96 | $33.64 | 9.10% | -2.93 |
+
+**Per-symbol highlights:**
+
+| Symbol | Best Model | MAPE | R² |
+|--------|------------|------|-----|
+| TSLA | LightGBM | 1.22% | 0.92 |
+| MSFT | LightGBM | 2.05% | 0.38 |
+| AAPL | Linear Regression | 4.24% | 0.35 |
+
+> Full results: [`evaluation_results.csv`](evaluation_results.csv) · Summary: [`evaluation_report.txt`](evaluation_report.txt) · Charts: [`evaluation_outputs/`](evaluation_outputs/)
+
+### Run the evaluation
+
+**Requirements:** Python **3.11** (see `.python-version`) and `pip install -r backend/requirements.txt`. CNN evaluation requires `tensorflow-cpu`.
+
+```bash
+cd backend
+
+# Evaluate a single symbol
+python -c "from evaluation import evaluate_symbol; evaluate_symbol('AAPL')"
+
+# Evaluate multiple symbols (default: AAPL, MSFT, TSLA, GOOGL, AMZN)
+python evaluation.py
+```
+
+**Outputs generated at project root:**
+
+```
+evaluation_results.csv       # Per-model metrics (CSV)
+evaluation_report.txt        # Best/worst models, averages, recommendations
+evaluation_outputs/          # Actual vs predicted charts, error & performance comparisons
+```
+
+---
+
+## 📂 Project Structure
+
+```
+StockView/
+│── frontend/
+│   ├── src/App.jsx           # React app (UI and chart logic)
+│   └── ...
+│
+│── backend/
+│   ├── main.py               # FastAPI routes
+│   ├── config.py             # Environment configuration
+│   ├── features.py           # Technical indicators & feature engineering
+│   ├── data.py               # yfinance data pipeline with caching
+│   ├── metrics.py            # Chronological splits & evaluation metrics
+│   ├── recommendations.py    # Symbol-specific model recommendations
+│   ├── models/               # Training & multi-step prediction
+│   ├── evaluation.py         # Offline backtesting framework
+│   ├── tests/                # pytest unit tests
+│   └── requirements.txt
+│
+│── evaluation_results.csv    # Benchmark metrics (generated by evaluation.py)
+│── evaluation_report.txt     # Summary report with recommendations
+│── evaluation_outputs/       # Evaluation charts (actual vs predicted, comparisons)
+│── README.md
+```
+
+---
+
+## 🖼️ Preview
+
+<p align="center">
+  <img src="https://private-user-images.githubusercontent.com/192932780/497589963-e8ce19cb-865a-4e03-beae-8cb2c346bd06.jpg?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NTk3MDExMDUsIm5iZiI6MTc1OTcwMDgwNSwicGF0aCI6Ii8xOTI5MzI3ODAvNDk3NTg5OTYzLWU4Y2UxOWNiLTg2NWEtNGUwMy1iZWFlLThjYjJjMzQ2YmQwNi5qcGc_WC1BbXotQWxnb3JpdGhtPUFXUzQtSE1BQy1TSEEyNTYmWC1BbXotQ3JlZGVudGlhbD1BS0lBVkNPRFlMU0E1M1BRSzRaQSUyRjIwMjUxMDA1JTJGdXMtZWFzdC0xJTJGczMlMkZhd3M0X3JlcXVlc3QmWC1BbXotRGF0ZT0yMDI1MTAwNVQyMTQ2NDVaJlgtQW16LUV4cGlyZXM9MzAwJlgtQW16LVNpZ25hdHVyZT0zY2FlYmNmMjljMDUwYzg3YTAzMDM3MWQxYWMzMWU2MjhiMGNjZjA4OTRjMDc0ZTY4MmFkMzVjMzZlNDFiYjEwJlgtQW16LVNpZ25lZEhlYWRlcnM9aG9zdCJ9.tbZpP3zqGcKsuDSN0q9l4X3MsWJNxTytOUSSWrkN11g" alt="StockView Dashboard Preview" />
+</p>
+
+<p align="center">
+  <img src="https://private-user-images.githubusercontent.com/192932780/497589962-9edb6668-a98d-4237-8833-7380cf8bbdac.jpg?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NTk3MDExMDUsIm5iZiI6MTc1OTcwMDgwNSwicGF0aCI6Ii8xOTI5MzI3ODAvNDk3NTg5OTYyLTllZGI2NjY4LWE5OGQtNDIzNy04ODMzLTczODBjZjhiYmRhYy5qcGc_WC1BbXotQWxnb3JpdGhtPUFXUzQtSE1BQy1TSEEyNTYmWC1BbXotQ3JlZGVudGlhbD1BS0lBVkNPRFlMU0E1M1BRSzRaQSUyRjIwMjUxMDA1JTJGdXMtZWFzdC0xJTJGczMlMkZhd3M0X3JlcXVlc3QmWC1BbXotRGF0ZT0yMDI1MTAwNVQyMTQ2NDVaJlgtQW16LUV4cGlyZXM9MzAwJlgtQW16LVNpZ25hdHVyZT1lOTY1YWU4YjFhMGQ0NjJjNGUwOTAzMDk4YTY5ZDAxYWYxNWI0OWQ3NDAxNTA4NTkzY2EwY2Q1OWVkNGFkNWRlJlgtQW16LVNpZ25lZEhlYWRlcnM9aG9zdCJ9.6PE03k13nSFFE1bAgYaZrvonmoH85QY4AZgKkD4BEkI" alt="StockView Predictions and Anomalies" />
+</p>
+
+<p align="center">
+  <img src="https://private-user-images.githubusercontent.com/192932780/497589965-bd4e8e6d-2a08-46a1-a38a-0f24885c9ec2.jpg?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NTk3MDExMDUsIm5iZiI6MTc1OTcwMDgwNSwicGF0aCI6Ii8xOTI5MzI3ODAvNDk3NTg5OTY1LWJkNGU4ZTZkLTJhMDgtNDZhMS1hMzhhLTBmMjQ4ODVjOWVjMi5qcGc_WC1BbXotQWxnb3JpdGhtPUFXUzQtSE1BQy1TSEEyNTYmWC1BbXotQ3JlZGVudGlhbD1BS0lBVkNPRFlMU0E1M1BRSzRaQSUyRjIwMjUxMDA1JTJGdXMtZWFzdC0xJTJGczMlMkZhd3M0X3JlcXVlc3QmWC1BbXotRGF0ZT0yMDI1MTAwNVQyMTQ2NDVaJlgtQW16LUV4cGlyZXM9MzAwJlgtQW16LVNpZ25hdHVyZT1hMTMxMzdjM2ZmZjQ3MDMxZjg2NzE3ZjBmYjlhYWJhNTdjOWYzZDBjMDEwZWM4ZGEwNDA3ZDEzOThlOWE4Y2I5JlgtQW16LVNpZ25lZEhlYWRlcnM9aG9zdCJ9.Zd6wV2joFogUfKbPMQIiJbrpmsO4m2eSVjK1RQSoWS8" alt="StockView Predictions and Anomalies" />
+</p>
+
+<p align="center">
+  <img src="https://private-user-images.githubusercontent.com/192932780/497589964-0b804850-c252-4c07-8320-8af08b6ab562.jpg?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NTk3MDExMDUsIm5iZiI6MTc1OTcwMDgwNSwicGF0aCI6Ii8xOTI5MzI3ODAvNDk3NTg5OTY0LTBiODA0ODUwLWMyNTItNGMwNy04MzIwLThhZjA4YjZhYjU2Mi5qcGc_WC1BbXotQWxnb3JpdGhtPUFXUzQtSE1BQy1TSEEyNTYmWC1BbXotQ3JlZGVudGlhbD1BS0lBVkNPRFlMU0E1M1BRSzRaQSUyRjIwMjUxMDA1JTJGdXMtZWFzdC0xJTJGczMlMkZhd3M0X3JlcXVlc3QmWC1BbXotRGF0ZT0yMDI1MTAwNVQyMTQ2NDVaJlgtQW16LUV4cGlyZXM9MzAwJlgtQW16LVNpZ25hdHVyZT1mODdkMDVmNjNhZGMzOGQzY2VlODAyODIzZjQ3NDg2ZjA3NWJmOGRhMjFjYmM5MTVkOGFiYmE5N2U0MDA5NjQyJlgtQW16LVNpZ25lZEhlYWRlcnM9aG9zdCJ9.cN8Vh6F1gbw9Kf8-Mny87XAhIyeTatFQlxh0zkIRUJQ" alt="StockView Predictions and Anomalies" />
+</p>
+
+> Replace the placeholder images above with actual screenshots of your app for a better showcase.
+
+---
+
+## 🚀 Deployment
+
+For complete deployment instructions, see **[DEPLOYMENT_COMPLETE_GUIDE.md](DEPLOYMENT_COMPLETE_GUIDE.md)**
+
+**Quick Overview:**
+- **Backend**: Deploy to Render (see guide for details)
+- **Frontend**: Deploy to Vercel (see guide for details)
+- **Firestore**: Configure security rules in Firebase Console
+
+---
+
+## ⚙️ Local Development
+
+### Environment variables
+
+Copy `backend/.env.example` to `backend/.env` and set:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `NEWS_API_KEY` | Yes (for news) | [NewsAPI](https://newsapi.org/) key |
+| `CORS_ORIGINS` | No | Comma-separated frontend URLs (default: `*`) |
+
+On Render, set `NEWS_API_KEY` in the dashboard (see `render.yaml`).
+
+### Backend (FastAPI)
+
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
+
+Runs at → `http://localhost:8000`
+
+### Frontend (React + Vite)
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Runs at → `http://localhost:5173`
+
+---
+
+## 🖥️ Usage
+
+1. Search for a stock symbol (e.g., `AAPL`, `TSLA`).
+2. Explore real-time price charts with SMA and anomalies.
+3. Toggle **ML predictions** and **model comparison**.
+4. Check news headlines with sentiment analysis.
+5. Save your favorite stocks in the **watchlist**.
+
+---
+
+## ⚠️ Disclaimer
+
+This project is for **educational purposes only**.
+Predictions and insights are **not financial advice**.
+
+---
+
+## 📌 Notes
+
+* Optimized for **desktop browsers only** (not mobile responsive).
+* Requires valid API keys (`NEWS_API_KEY` for news; Firebase for watchlist).
+* Live ML metrics use **chronological 80/20 holdout** (out-of-sample).
+* Symbol-specific algorithm recommendations via `/evaluation/recommendation`.
+* GitHub Actions CI runs backend unit tests on push.
+* Works best on Chrome, Edge, or Firefox.
