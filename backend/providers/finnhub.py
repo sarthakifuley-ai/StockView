@@ -11,11 +11,11 @@ from datetime import date, timedelta
 
 import requests  # type: ignore
 
-from config import get_finnhub_api_key
+from config import FINNHUB_TIMEOUT_SECONDS, get_finnhub_api_key
 from errors import ProviderError, SymbolNotFoundError, UpstreamRateLimitError
 
 BASE_URL = "https://finnhub.io/api/v1"
-TIMEOUT_SECONDS = 8
+TIMEOUT_SECONDS = FINNHUB_TIMEOUT_SECONDS
 
 # One shared session reuses TCP/TLS connections across requests.
 _session = requests.Session()

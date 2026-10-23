@@ -57,6 +57,22 @@ MODEL_CACHE_TTL_SECONDS = int(os.environ.get("MODEL_CACHE_TTL_SECONDS", "3600"))
 DATA_CACHE_TTL_SECONDS = int(os.environ.get("DATA_CACHE_TTL_SECONDS", "300"))
 COMPANY_NAME_CACHE_TTL_SECONDS = int(os.environ.get("COMPANY_NAME_CACHE_TTL_SECONDS", "86400"))
 
+# --- Upstream request limits (performance / hang protection) ---------------
+# Network timeout handed to yfinance so the underlying HTTP call really stops.
+YF_NETWORK_TIMEOUT_SECONDS = float(os.environ.get("YF_NETWORK_TIMEOUT_SECONDS", "10"))
+# Wall-clock limit a request thread will wait for a yfinance call to return.
+YF_DEADLINE_SECONDS = float(os.environ.get("YF_DEADLINE_SECONDS", "15"))
+# Short deadline for optional lookups (volume, company name) on the /price path.
+BEST_EFFORT_DEADLINE_SECONDS = float(os.environ.get("BEST_EFFORT_DEADLINE_SECONDS", "3"))
+# Worker threads for yfinance, and the max number of yfinance calls that may be
+# running or queued at once (timed-out calls still count until they finish).
+YF_MAX_WORKERS = int(os.environ.get("YF_MAX_WORKERS", "4"))
+YF_MAX_PENDING = int(os.environ.get("YF_MAX_PENDING", "8"))
+# How long a failed upstream call is remembered so we don't hammer a sick provider.
+FAILURE_CACHE_TTL_SECONDS = int(os.environ.get("FAILURE_CACHE_TTL_SECONDS", "30"))
+NAME_FAILURE_TTL_SECONDS = int(os.environ.get("NAME_FAILURE_TTL_SECONDS", "300"))
+FINNHUB_TIMEOUT_SECONDS = float(os.environ.get("FINNHUB_TIMEOUT_SECONDS", "5"))
+
 VALID_ALGORITHMS = [
     "linear_regression",
     "random_forest",

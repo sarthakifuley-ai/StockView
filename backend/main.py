@@ -10,7 +10,7 @@ import traceback
 import pandas as pd  # type: ignore
 import requests  # type: ignore
 import warnings
-from fastapi import FastAPI, HTTPException  # type: ignore
+from fastapi import FastAPI, HTTPException, Response  # type: ignore
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # type: ignore
 from yfinance.exceptions import YFRateLimitError  # type: ignore
@@ -25,7 +25,7 @@ from config import (
     get_news_api_key,
 )
 from data import download_stock_data, get_company_name, get_quote
-from errors import ProviderError, UpstreamRateLimitError
+from errors import ProviderError, UpstreamBusyError, UpstreamRateLimitError, UpstreamTimeoutError
 from providers import finnhub
 from features import prepare_features
 from models.prediction import (
@@ -53,6 +53,8 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET"],
     allow_headers=["*"],
+    # Lets the browser read data-freshness headers set by /history.
+    expose_headers=["X-Data-Stale", "X-Data-Fetched-At"],
 )
 
 _model_cache = TTLCache(ttl_seconds=MODEL_CACHE_TTL_SECONDS, max_size=50, name="model", max_stale_seconds=86400)
@@ -72,6 +74,12 @@ def _log_and_raise(endpoint: str, exc: Exception) -> None:
             detail="Market data provider is rate limiting requests. Please try again in a minute.",
             headers={"Retry-After": "60"},
         )
+    if isinstance(exc, UpstreamBusyError):
+        print(f"Upstream busy in {endpoint}: {exc}")
+        raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "5"})
+    if isinstance(exc, UpstreamTimeoutError):
+        print(f"Upstream timeout in {endpoint}: {exc}")
+        raise HTTPException(status_code=504, detail=str(exc))
     if isinstance(exc, ProviderError):
         print(f"Provider error in {endpoint}: {exc}")
         raise HTTPException(status_code=502, detail=str(exc))
@@ -176,6 +184,11 @@ def get_price(symbol: str):
             "change": r(quote.get("change")),
             "change_percent": r(quote.get("change_percent")),
             "source": quote.get("source"),
+            # Freshness: when we obtained the data, the provider's own trade
+            # time if known, and whether this is an expired cached copy.
+            "fetched_at": quote.get("fetched_at"),
+            "as_of": quote.get("as_of"),
+            "stale": bool(quote.get("stale", False)),
         }
     except ValueError:
         raise HTTPException(status_code=404, detail="Stock symbol not found")
@@ -186,9 +199,13 @@ def get_price(symbol: str):
 
 
 @app.get("/history")
-def get_history(symbol: str, range: str = "1d", interval: str = "5m"):
+def get_history(response: Response, symbol: str, range: str = "1d", interval: str = "5m"):
     try:
         data = download_stock_data(symbol, period=range, interval=interval, min_rows=1)
+        # Body stays a plain list for compatibility; freshness goes in headers.
+        response.headers["X-Data-Stale"] = "true" if data.attrs.get("stale") else "false"
+        if data.attrs.get("fetched_at"):
+            response.headers["X-Data-Fetched-At"] = str(int(data.attrs["fetched_at"]))
         data["SMA_10"] = data["Close"].rolling(window=10).mean()
 
         window = 20 if interval.endswith("m") else 50 if interval.endswith("h") else 100
