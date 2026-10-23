@@ -1,5 +1,5 @@
 import axios from "axios";
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { TrendingUp, TrendingDown, Activity, BarChart3, Star, HelpCircle, X, Search, Plus, Trash2, ExternalLink, Clock, Zap, Brain } from "lucide-react";
 import { db } from "./firebase";
 import { collection, getDocs, addDoc, deleteDoc, doc } from "firebase/firestore";
@@ -7,6 +7,98 @@ import { Cell, Bar, BarChart, LineChart, Line, XAxis, YAxis, Tooltip, Responsive
 
 // Get API URL from environment or use localhost as fallback
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
+// ============================================
+// REQUEST HELPERS
+// ============================================
+
+// Every network call gets a timeout so a stalled server can never leave the UI
+// loading forever. Market-data calls retry once on a timeout, a network
+// failure or a 502/503/504 (typical while a free-tier server is waking up).
+const REQUEST_TIMEOUT_MS = 30000;
+const VALIDATE_TIMEOUT_MS = 15000;
+const NEWS_TIMEOUT_MS = 20000;
+const PREDICT_TIMEOUT_MS = 120000;
+const COMPARE_TIMEOUT_MS = 240000;
+const SLOW_LOAD_HINT_MS = 8000;
+const RETRY_DELAY_MS = 2000;
+const RETRY_STATUSES = new Set([502, 503, 504]);
+
+class ApiTimeoutError extends Error {
+  constructor() {
+    super("The request timed out. The market data server may be slow or waking up - please try again.");
+    this.name = "ApiTimeoutError";
+  }
+}
+
+const isAbortError = (err) => err?.name === "AbortError" || err?.code === "ERR_CANCELED";
+
+const abortableSleep = (ms, signal) =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+
+const apiFetch = async (url, { timeoutMs = REQUEST_TIMEOUT_MS, signal, retry = true } = {}) => {
+  const attempt = async () => {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const ctrl = new AbortController();
+    let timedOut = false;
+    const onAbort = () => ctrl.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, timeoutMs);
+    try {
+      return await fetch(url, { signal: ctrl.signal });
+    } catch (err) {
+      if (timedOut) throw new ApiTimeoutError();
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    }
+  };
+
+  let res;
+  try {
+    res = await attempt();
+  } catch (err) {
+    if (!retry || !(err instanceof TypeError || err instanceof ApiTimeoutError)) throw err;
+    await abortableSleep(RETRY_DELAY_MS, signal);
+    return attempt();
+  }
+  if (retry && RETRY_STATUSES.has(res.status)) {
+    await abortableSleep(RETRY_DELAY_MS, signal);
+    return attempt();
+  }
+  return res;
+};
+
+// Freshness notice: when the data was obtained, and whether it is a cached copy.
+const formatDataTime = (epochSeconds) =>
+  new Date(epochSeconds * 1000).toLocaleString([], {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+  });
+
+const describeFreshness = (meta) => {
+  if (!meta) return null;
+  const when = formatDataTime((meta.stale ? meta.fetchedAt : meta.asOf || meta.fetchedAt) || Date.now() / 1000);
+  if (meta.priceStale || meta.chartStale) {
+    const what = meta.priceStale && meta.chartStale ? "price and chart" : meta.priceStale ? "price" : "chart";
+    return { stale: true, text: `Showing cached ${what} data from ${when} - the live data provider is unavailable.` };
+  }
+  return { stale: false, text: `Data as of ${when}` };
+};
 
 // ============================================
 // CUSTOM COMPONENTS
@@ -218,6 +310,46 @@ function App() {
   const [algorithmComparison, setAlgorithmComparison] = useState(null);
   const [showComparison, setShowComparison] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  const [dataMeta, setDataMeta] = useState(null);
+  const [slowLoad, setSlowLoad] = useState(false);
+
+  // Request coordination: only one price+chart request runs at a time. A manual
+  // action cancels whatever is in flight; the automatic refresh yields instead.
+  const activeCtrlRef = useRef(null);     // price + chart request currently in flight
+  const secondaryCtrlRef = useRef(null);  // news + recommended algorithm (non-blocking)
+  const searchIdRef = useRef(0);          // bumps on each manual search
+  const validatingRef = useRef(false);    // watchlist symbol validation in flight
+  const addInputRef = useRef(null);
+
+  const beginPrimary = ({ newSearch = false } = {}) => {
+    activeCtrlRef.current?.abort();
+    if (newSearch) {
+      secondaryCtrlRef.current?.abort();
+      searchIdRef.current += 1;
+    }
+    const ctrl = new AbortController();
+    activeCtrlRef.current = ctrl;
+    return { id: searchIdRef.current, ctrl };
+  };
+  const endPrimary = (ctrl) => {
+    if (activeCtrlRef.current === ctrl) activeCtrlRef.current = null;
+  };
+
+  // Cancel anything in flight when the page unmounts.
+  useEffect(() => () => {
+    activeCtrlRef.current?.abort();
+    secondaryCtrlRef.current?.abort();
+  }, []);
+
+  // After a while, tell the user the wait is unusual instead of looking frozen.
+  useEffect(() => {
+    if (!loading) {
+      setSlowLoad(false);
+      return undefined;
+    }
+    const t = setTimeout(() => setSlowLoad(true), SLOW_LOAD_HINT_MS);
+    return () => clearTimeout(t);
+  }, [loading]);
 
   // Fetch watchlist
   const fetchWatchlist = async () => {
@@ -246,20 +378,57 @@ function App() {
     }
   };
 
+  // Validate (only if needed) and add a typed symbol. Skips the network entirely
+  // for symbols already in the watchlist or already loaded on the dashboard.
+  const handleAddSymbol = async (rawSymbol, inputEl) => {
+    const sym = rawSymbol.trim().toUpperCase();
+    if (!sym || validatingRef.current) return;
+    if (watchlist.some(item => item.symbol === sym)) {
+      setPopupMessage("Symbol already in watchlist!");
+      setShowPopup(true);
+      return;
+    }
+
+    validatingRef.current = true;
+    try {
+      // A symbol already loaded on the dashboard was validated by that load.
+      if (data?.symbol !== sym) {
+        const response = await apiFetch(`${API_URL}/price?symbol=${encodeURIComponent(sym)}`, {
+          timeoutMs: VALIDATE_TIMEOUT_MS,
+          retry: false,
+        });
+        if (!response.ok) {
+          setPopupMessage(response.status === 404 ? "Invalid stock symbol" : "Could not validate the symbol right now. Please try again.");
+          setShowPopup(true);
+          return;
+        }
+      }
+      await addToWatchlist(sym);
+      if (inputEl) inputEl.value = "";
+    } catch {
+      setPopupMessage("Error validating symbol");
+      setShowPopup(true);
+    } finally {
+      validatingRef.current = false;
+    }
+  };
+
   // Remove from watchlist
   const removeFromWatchlist = async (id) => {
     await deleteDoc(doc(db, "watchlist", id));
     fetchWatchlist();
   };
 
-  // Fetch stock data
-  const fetchStock = useCallback(async (symbolOverride = symbol, selectedRange = range.value, selectedInterval = range.interval) => {
+  // Fetch price + chart. Never throws: resolves to "ok", "error" (message is
+  // stored in `error`) or "aborted" (superseded by a newer request).
+  const fetchStock = useCallback(async (symbolOverride = symbol, selectedRange = range.value, selectedInterval = range.interval, signal) => {
     try {
       setError("");
+      const sym = encodeURIComponent(symbolOverride);
 
       const [priceRes, chartRes] = await Promise.all([
-        fetch(`${API_URL}/price?symbol=${symbolOverride}`),
-        fetch(`${API_URL}/history?symbol=${symbolOverride}&range=${selectedRange}&interval=${selectedInterval}`)
+        apiFetch(`${API_URL}/price?symbol=${sym}`, { signal }),
+        apiFetch(`${API_URL}/history?symbol=${sym}&range=${selectedRange}&interval=${selectedInterval}`, { signal })
       ]);
 
       const toApiError = async (res, fallback) => {
@@ -281,9 +450,25 @@ function App() {
 
       const newPrice = await priceRes.json();
       const newChart = await chartRes.json();
+      if (signal?.aborted) return "aborted";
+
+      // Freshness: is any of this an expired cached copy, and from when?
+      const priceStale = Boolean(newPrice.stale);
+      const chartStale = chartRes.headers.get("x-data-stale") === "true";
+      const chartFetched = Number(chartRes.headers.get("x-data-fetched-at")) || null;
+      const staleTimes = [priceStale && newPrice.fetched_at, chartStale && chartFetched].filter(Boolean);
+      setDataMeta({
+        priceStale,
+        chartStale,
+        stale: priceStale || chartStale,
+        asOf: newPrice.as_of || null,
+        fetchedAt: staleTimes.length ? Math.min(...staleTimes) : (newPrice.fetched_at || chartFetched),
+      });
 
       setData(prevData => {
-        if (!prevData || prevData.price !== newPrice.price || prevData.volume !== newPrice.volume) {
+        if (!prevData || prevData.symbol !== newPrice.symbol || prevData.price !== newPrice.price ||
+          prevData.volume !== newPrice.volume || prevData.stale !== newPrice.stale ||
+          prevData.fetched_at !== newPrice.fetched_at || prevData.company !== newPrice.company) {
           return newPrice;
         }
         return prevData;
@@ -297,71 +482,121 @@ function App() {
         return prevChart;
       });
 
-      setLastUpdate(new Date().toLocaleTimeString());
+      const shownAt = newPrice.fetched_at ? new Date(newPrice.fetched_at * 1000) : new Date();
+      setLastUpdate(shownAt.toLocaleTimeString() + (priceStale || chartStale ? " (cached)" : ""));
+      return "ok";
     } catch (err) {
-      if (err.name === 'TypeError' && err.message.includes('fetch')) {
+      if (isAbortError(err) || signal?.aborted) return "aborted";
+      if (err.name === 'TypeError') {
         setError(`Cannot connect to backend. Please check if the server is running.`);
       } else {
         setError(err.message || "Failed to fetch stock data");
       }
+      return "error";
     }
   }, [symbol, range.value, range.interval]);
 
-  // Search handler
-  const handleSearch = async () => {
-    if (!symbol.trim()) {
+  // Recommended algorithm (secondary; failures are ignored).
+  const fetchRecommendedAlgorithm = useCallback(async (symbolOverride = symbol, signal) => {
+    try {
+      const response = await apiFetch(
+        `${API_URL}/evaluation/recommendation?symbol=${encodeURIComponent(symbolOverride)}`,
+        { signal, timeoutMs: NEWS_TIMEOUT_MS, retry: false }
+      );
+      if (!response.ok) return null;
+      const body = await response.json();
+      return body.recommended_algorithm || null;
+    } catch {
+      return null; // keep current selection if the recommendation endpoint is unavailable
+    }
+  }, [symbol]);
+
+  // News + recommendation load in the background, after the dashboard is shown.
+  const loadSecondary = useCallback(async (sym, searchId) => {
+    secondaryCtrlRef.current?.abort();
+    const ctrl = new AbortController();
+    secondaryCtrlRef.current = ctrl;
+
+    const newsPromise = axios
+      .get(`${API_URL}/news?symbol=${encodeURIComponent(sym)}`, { signal: ctrl.signal, timeout: NEWS_TIMEOUT_MS })
+      .then(res => res.data.news || [])
+      .catch(err => {
+        if (!isAbortError(err)) console.warn("News unavailable:", err.message);
+        return null;
+      });
+    const recPromise = fetchRecommendedAlgorithm(sym, ctrl.signal);
+
+    const [newsItems, recommended] = await Promise.all([newsPromise, recPromise]);
+    if (ctrl.signal.aborted || searchIdRef.current !== searchId) return; // superseded
+    setNews(newsItems || []);
+    if (recommended) {
+      setRecommendedAlgorithm(recommended);
+      setSelectedAlgorithm(recommended);
+    }
+  }, [fetchRecommendedAlgorithm]);
+
+  // Search handler. Shows the dashboard as soon as price + chart are ready.
+  // Pass a symbol to search for it directly (popular stocks, watchlist);
+  // `reset` clears the previous stock first.
+  const handleSearch = async (symbolOverride, { reset = false } = {}) => {
+    const direct = typeof symbolOverride === "string";
+    const sym = (direct ? symbolOverride : symbol).trim();
+    if (!sym) {
       setData(null);
       setChartData([]);
       setError("Please enter a stock symbol.");
       return;
     }
 
-    setLoading(true);
-    setError("");
-    try {
-      await fetchStock(symbol, range.value, range.interval);
-      await fetchRecommendedAlgorithm(symbol);
-      const res = await axios.get(`${API_URL}/news?symbol=${symbol}`);
-      setNews(res.data.news || []);
+    if (direct) setSymbol(sym);
+    if (reset) {
+      setData(null);
+      setChartData([]);
+      setNews([]);
       setPredictions([]);
       setShowPredictions(false);
-    } catch (err) {
-      const apiDetail = err.response?.data?.detail;
-      const errorMessage = apiDetail || err.message || "Unknown error occurred";
-
-      if (err.message && err.message.includes('Network Error')) {
-        setPopupMessage(`Cannot connect to backend API.`);
-      } else if (err.message && err.message.includes('404')) {
-        setPopupMessage("Stock symbol not found. Please enter a valid symbol.");
-      } else {
-        setPopupMessage(`Error: ${errorMessage}`);
-      }
-      setShowPopup(true);
-      setError(errorMessage);
-      setNews([]);
     }
-    setLoading(false);
+
+    // A new search cancels any search or automatic refresh already in flight.
+    const { id, ctrl } = beginPrimary({ newSearch: true });
+    setLoading(true);
+    setError("");
+    let result = "error";
+    try {
+      result = await fetchStock(sym, range.value, range.interval, ctrl.signal);
+      if (searchIdRef.current !== id) return;
+      if (result === "ok") {
+        setPredictions([]);
+        setShowPredictions(false);
+      } else if (result === "error") {
+        setNews([]);
+      }
+    } finally {
+      endPrimary(ctrl);
+      if (searchIdRef.current === id) setLoading(false);
+    }
+
+    if (result === "ok") loadSecondary(sym, id);
   };
 
-  // Fetch recommended algorithm for symbol
-  const fetchRecommendedAlgorithm = useCallback(async (symbolOverride = symbol) => {
+  // Range buttons: refetch the displayed stock without the full-page spinner.
+  const handleRangeChange = async (value, interval) => {
+    setRange({ value, interval });
+    const { ctrl } = beginPrimary();
     try {
-      const response = await fetch(`${API_URL}/evaluation/recommendation?symbol=${symbolOverride}`);
-      if (!response.ok) return;
-      const data = await response.json();
-      setRecommendedAlgorithm(data.recommended_algorithm);
-      setSelectedAlgorithm(data.recommended_algorithm);
-    } catch {
-      // Keep current selection if recommendation endpoint is unavailable
+      await fetchStock(data?.symbol || symbol, value, interval, ctrl.signal);
+    } finally {
+      endPrimary(ctrl);
     }
-  }, [symbol]);
+  };
 
   // Fetch predictions
   const fetchPredictions = useCallback(async (symbolOverride = symbol, algorithm = selectedAlgorithm) => {
     setPredictionLoading(true);
     try {
-      const response = await fetch(
-        `${API_URL}/predict?symbol=${symbolOverride}&period=1y&interval=1d&steps=5&algorithm=${algorithm}`
+      const response = await apiFetch(
+        `${API_URL}/predict?symbol=${encodeURIComponent(symbolOverride)}&period=1y&interval=1d&steps=5&algorithm=${algorithm}`,
+        { timeoutMs: PREDICT_TIMEOUT_MS, retry: false }
       );
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -390,7 +625,10 @@ function App() {
   // Fetch algorithm comparison
   const fetchAlgorithmComparison = useCallback(async (symbolOverride = symbol) => {
     try {
-      const response = await fetch(`${API_URL}/predict/compare?symbol=${symbolOverride}&period=1y&interval=1d`);
+      const response = await apiFetch(
+        `${API_URL}/predict/compare?symbol=${encodeURIComponent(symbolOverride)}&period=1y&interval=1d`,
+        { timeoutMs: COMPARE_TIMEOUT_MS, retry: false }
+      );
       if (!response.ok) throw new Error("Failed to fetch algorithm comparison");
       const comparisonData = await response.json();
       setAlgorithmComparison(comparisonData);
@@ -403,18 +641,28 @@ function App() {
     }
   }, [symbol]);
 
-  // Auto-refresh
+  // Auto-refresh the displayed stock. Skips a tick if any request is in flight.
+  const displayedSymbol = data?.symbol;
   useEffect(() => {
-    const intervalId = setInterval(() => {
-      if (symbol) fetchStock(symbol, range.value, range.interval);
+    const intervalId = setInterval(async () => {
+      if (!displayedSymbol || activeCtrlRef.current) return;
+      const ctrl = new AbortController();
+      activeCtrlRef.current = ctrl;
+      try {
+        await fetchStock(displayedSymbol, range.value, range.interval, ctrl.signal);
+      } finally {
+        endPrimary(ctrl);
+      }
     }, 600000);
     return () => clearInterval(intervalId);
-  }, [symbol, range, fetchStock]);
+  }, [displayedSymbol, range, fetchStock]);
 
   // Load watchlist on mount
   useEffect(() => {
     fetchWatchlist();
   }, []);
+
+  const freshness = useMemo(() => describeFreshness(dataMeta), [dataMeta]);
 
   // Memoized anomaly data
   const anomalyData = useMemo(() => chartData.filter(d => d.anomaly), [chartData]);
@@ -506,10 +754,7 @@ function App() {
                   {["AAPL", "MSFT", "GOOGL", "TSLA", "AMZN"].map(s => (
                     <button
                       key={s}
-                      onClick={() => {
-                        setSymbol(s);
-                        setTimeout(() => handleSearch(), 100);
-                      }}
+                      onClick={() => handleSearch(s)}
                       className="px-3 py-1.5 text-xs font-mono bg-dark-700 text-gray-300 rounded-lg hover:bg-accent-cyan hover:text-dark-900 transition-all"
                     >
                       {s}
@@ -567,7 +812,7 @@ function App() {
                         className="input-field pl-12"
                       />
                     </div>
-                    <button onClick={handleSearch} className="btn-primary flex items-center gap-2">
+                    <button onClick={() => handleSearch()} className="btn-primary flex items-center gap-2">
                       <Search size={18} />
                       Search
                     </button>
@@ -577,7 +822,7 @@ function App() {
                 {/* Loading State */}
                 {loading && (
                   <div className="glass-card p-12">
-                    <LoadingSpinner text="Fetching stock data..." />
+                    <LoadingSpinner text={slowLoad ? "Still loading - the server may be waking up. This can take up to a minute..." : "Fetching stock data..."} />
                   </div>
                 )}
 
@@ -606,6 +851,11 @@ function App() {
                               ${data.price}
                             </span>
                           </div>
+                          {freshness && (
+                            <p className={`text-xs mt-1 ${freshness.stale ? "text-chart-orange" : "text-gray-500"}`}>
+                              {freshness.text}
+                            </p>
+                          )}
                         </div>
 
                         <button
@@ -683,10 +933,7 @@ function App() {
                           key={value}
                           label={label}
                           active={range.value === value}
-                          onClick={() => {
-                            setRange({ value, interval });
-                            fetchStock(symbol, value, interval);
-                          }}
+                          onClick={() => handleRangeChange(value, interval)}
                         />
                       ))}
                     </div>
@@ -925,25 +1172,8 @@ function App() {
                       <div key={item.id} className="watchlist-item">
                         <button
                           onClick={async () => {
-                            setData(null);
-                            setChartData([]);
-                            setNews([]);
-                            setError("");
-                            setPredictions([]);
-                            setShowPredictions(false);
-                            setSymbol(item.symbol);
-                            setLoading(true);
-
-                            try {
-                              await fetchStock(item.symbol, range.value, range.interval);
-                              const res = await axios.get(`${API_URL}/news?symbol=${item.symbol}`);
-                              setNews(res.data.news || []);
-                            } catch (err) {
-                              setError("Failed to load stock data: " + err.message);
-                            }
-
-                            setLoading(false);
                             setViewMode("chart");
+                            await handleSearch(item.symbol, { reset: true });
                           }}
                           className="font-mono font-semibold text-accent-cyan hover:text-accent-cyan-light transition-colors"
                         >
@@ -969,45 +1199,13 @@ function App() {
                     type="text"
                     placeholder="Add symbol (e.g. NVDA)"
                     className="input-field flex-1"
-                    onKeyDown={async (e) => {
-                      if (e.key === "Enter") {
-                        const sym = e.target.value.trim().toUpperCase();
-                        if (!sym) return;
-                        try {
-                          const response = await fetch(`${API_URL}/price?symbol=${sym}`);
-                          if (response.ok) {
-                            await addToWatchlist(sym);
-                            e.target.value = "";
-                          } else {
-                            setPopupMessage("Invalid stock symbol");
-                            setShowPopup(true);
-                          }
-                        } catch {
-                          setPopupMessage("Error validating symbol");
-                          setShowPopup(true);
-                        }
-                      }
+                    ref={addInputRef}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleAddSymbol(e.target.value, e.target);
                     }}
                   />
                   <button
-                    onClick={async () => {
-                      const input = document.querySelector('input[placeholder="Add symbol (e.g. NVDA)"]');
-                      const sym = input.value.trim().toUpperCase();
-                      if (!sym) return;
-                      try {
-                        const response = await fetch(`${API_URL}/price?symbol=${sym}`);
-                        if (response.ok) {
-                          await addToWatchlist(sym);
-                          input.value = "";
-                        } else {
-                          setPopupMessage("Invalid stock symbol");
-                          setShowPopup(true);
-                        }
-                      } catch {
-                        setPopupMessage("Error validating symbol");
-                        setShowPopup(true);
-                      }
-                    }}
+                    onClick={() => handleAddSymbol(addInputRef.current?.value || "", addInputRef.current)}
                     className="btn-primary flex items-center gap-2"
                   >
                     <Plus size={18} />

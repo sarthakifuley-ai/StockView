@@ -202,6 +202,29 @@ def test_upstream_failure_without_cache_raises(fake):
         data.download_stock_data("AAPL", period="1y", interval="1d")
 
 
+def test_network_exception_becomes_provider_error_and_uses_stale_cache(fake):
+    fake.error = ConnectionError("Could not resolve host")
+    with pytest.raises(ProviderError) as info:
+        data.download_stock_data("AAPL", period="1y", interval="1d")
+    assert not isinstance(info.value, ValueError)  # not reported as "unknown symbol"
+    data._failures.clear()
+
+    seeded = _frame()
+    seeded.attrs = {"stale": False, "fetched_at": 1_700_000_000}
+    data._data_cache.set("AAPL:1y:1d", seeded)
+    with patch.object(data._data_cache, "get", return_value=None):  # simulate expiry
+        df = data.download_stock_data("AAPL", period="1y", interval="1d")
+    assert df.attrs["stale"] is True
+
+
+def test_empty_frame_after_network_failure_is_not_reported_as_unknown_symbol(fake, monkeypatch):
+    fake.frame = pd.DataFrame()
+    monkeypatch.setattr(data.yf_shared, "_ERRORS", {"AAPL": "Failed to perform, curl: (6) Could not resolve host"})
+    with pytest.raises(ProviderError) as info:
+        data.download_stock_data("AAPL", period="1y", interval="1d")
+    assert not isinstance(info.value, ValueError)
+
+
 def test_symbol_not_found_is_not_masked_by_stale_cache(fake):
     fake.frame = pd.DataFrame()
     with pytest.raises(SymbolNotFoundError):

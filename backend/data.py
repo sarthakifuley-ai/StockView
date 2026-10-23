@@ -16,6 +16,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 
 import yfinance as yf  # type: ignore
+import yfinance.shared as yf_shared  # type: ignore
 import pandas as pd  # type: ignore
 from yfinance.exceptions import YFRateLimitError  # type: ignore
 
@@ -216,6 +217,12 @@ _quote_flight = _Coalescer()
 # Historical candles (yfinance)
 # ---------------------------------------------------------------------------
 
+_NETWORK_ERROR_HINTS = (
+    "failed to perform", "could not resolve", "timed out", "timeout",
+    "connection", "ssl", "curl:",
+)
+
+
 def _tag(df: pd.DataFrame, *, stale: bool, fetched_at: float | None) -> pd.DataFrame:
     """Attach provenance to a frame (df.attrs survives .copy() and pickling)."""
     out = df.copy()
@@ -227,10 +234,28 @@ def _tag(df: pd.DataFrame, *, stale: bool, fetched_at: float | None) -> pd.DataF
 
 def _fetch_history(symbol: str, period: str, interval: str, min_rows: int, cache_key: str, use_cache: bool):
     """Runs on a worker thread. Validates and caches, so a late result is not wasted."""
-    data = yf.Ticker(symbol).history(
-        period=period, interval=interval, timeout=YF_NETWORK_TIMEOUT_SECONDS
-    )
+    try:
+        data = yf.Ticker(symbol).history(
+            period=period, interval=interval, timeout=YF_NETWORK_TIMEOUT_SECONDS
+        )
+    except (YFRateLimitError, ValueError):
+        raise
+    except Exception as exc:
+        # Network failures (DNS, connect, timeout, TLS) and yfinance internals
+        # are an upstream problem, not a bad symbol: report them as such so the
+        # stale-cache fallback and failure memory apply.
+        raise ProviderError(
+            f"Could not reach the market data provider for '{symbol}' ({type(exc).__name__}). "
+            "Please try again."
+        ) from exc
     if data.empty:
+        # yfinance swallows some errors and returns an empty frame. Tell a
+        # network failure apart from an unknown symbol using its error log.
+        last_error = str(getattr(yf_shared, "_ERRORS", {}).get(symbol, "")).lower()
+        if any(k in last_error for k in _NETWORK_ERROR_HINTS):
+            raise ProviderError(
+                f"Could not reach the market data provider for '{symbol}'. Please try again."
+            )
         raise SymbolNotFoundError(f"No data found for symbol '{symbol}'.")
     if len(data) < min_rows:
         raise ValueError(
