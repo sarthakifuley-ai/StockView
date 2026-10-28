@@ -119,3 +119,9 @@ firebase-debug.*.log
 .env.development.local
 .env.test.local
 .env.production.local
+backend/.venv/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
