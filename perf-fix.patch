@@ -1,0 +1,1630 @@
+diff --git a/backend/.env.example b/backend/.env.example
+index 8365b99..5b6c16c 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -19,3 +19,17 @@ FINNHUB_API_KEY=your_finnhub_key_here
+ # Optional Redis connection (survives Render restarts)
+ # Free serverless Redis at https://upstash.com/
+ # REDIS_URL=rediss://default:your_token@your-endpoint.upstash.io:6379
++
++# --- Upstream request limits (all optional; defaults shown) ---
++# Network timeout passed to yfinance, and the wall-clock limit a request waits for it.
++# YF_NETWORK_TIMEOUT_SECONDS=10
++# YF_DEADLINE_SECONDS=15
++# Optional lookups on /price (volume, company name) wait at most this long.
++# BEST_EFFORT_DEADLINE_SECONDS=3
++# Yahoo worker threads, and max yfinance calls running or still finishing at once.
++# YF_MAX_WORKERS=4
++# YF_MAX_PENDING=8
++# How long a failed upstream call is remembered before retrying.
++# FAILURE_CACHE_TTL_SECONDS=30
++# NAME_FAILURE_TTL_SECONDS=300
++# FINNHUB_TIMEOUT_SECONDS=5
+diff --git a/backend/config.py b/backend/config.py
+index f1c7dfc..7668c13 100644
+--- a/backend/config.py
++++ b/backend/config.py
+@@ -57,6 +57,22 @@ MODEL_CACHE_TTL_SECONDS = int(os.environ.get("MODEL_CACHE_TTL_SECONDS", "3600"))
+ DATA_CACHE_TTL_SECONDS = int(os.environ.get("DATA_CACHE_TTL_SECONDS", "300"))
+ COMPANY_NAME_CACHE_TTL_SECONDS = int(os.environ.get("COMPANY_NAME_CACHE_TTL_SECONDS", "86400"))
+ 
++# --- Upstream request limits (performance / hang protection) ---------------
++# Network timeout handed to yfinance so the underlying HTTP call really stops.
++YF_NETWORK_TIMEOUT_SECONDS = float(os.environ.get("YF_NETWORK_TIMEOUT_SECONDS", "10"))
++# Wall-clock limit a request thread will wait for a yfinance call to return.
++YF_DEADLINE_SECONDS = float(os.environ.get("YF_DEADLINE_SECONDS", "15"))
++# Short deadline for optional lookups (volume, company name) on the /price path.
++BEST_EFFORT_DEADLINE_SECONDS = float(os.environ.get("BEST_EFFORT_DEADLINE_SECONDS", "3"))
++# Worker threads for yfinance, and the max number of yfinance calls that may be
++# running or queued at once (timed-out calls still count until they finish).
++YF_MAX_WORKERS = int(os.environ.get("YF_MAX_WORKERS", "4"))
++YF_MAX_PENDING = int(os.environ.get("YF_MAX_PENDING", "8"))
++# How long a failed upstream call is remembered so we don't hammer a sick provider.
++FAILURE_CACHE_TTL_SECONDS = int(os.environ.get("FAILURE_CACHE_TTL_SECONDS", "30"))
++NAME_FAILURE_TTL_SECONDS = int(os.environ.get("NAME_FAILURE_TTL_SECONDS", "300"))
++FINNHUB_TIMEOUT_SECONDS = float(os.environ.get("FINNHUB_TIMEOUT_SECONDS", "5"))
++
+ VALID_ALGORITHMS = [
+     "linear_regression",
+     "random_forest",
+diff --git a/backend/data.py b/backend/data.py
+index ee7b1c7..195ffd5 100644
+--- a/backend/data.py
++++ b/backend/data.py
+@@ -10,18 +10,37 @@ directly. That lets us choose the best source per data type:
+     stale-on-rate-limit fallback.
+ """
+ 
++import threading
++import time
++from concurrent.futures import Future, ThreadPoolExecutor
++from concurrent.futures import TimeoutError as FutureTimeout
++
+ import yfinance as yf  # type: ignore
++import yfinance.shared as yf_shared  # type: ignore
+ import pandas as pd  # type: ignore
+ from yfinance.exceptions import YFRateLimitError  # type: ignore
+ 
+ from cache import TTLCache
+ from config import (
++    BEST_EFFORT_DEADLINE_SECONDS,
+     COMPANY_NAME_CACHE_TTL_SECONDS,
+     DATA_CACHE_TTL_SECONDS,
++    FAILURE_CACHE_TTL_SECONDS,
+     MIN_HISTORY_ROWS,
++    NAME_FAILURE_TTL_SECONDS,
+     QUOTE_CACHE_TTL_SECONDS,
++    YF_DEADLINE_SECONDS,
++    YF_MAX_PENDING,
++    YF_MAX_WORKERS,
++    YF_NETWORK_TIMEOUT_SECONDS,
++)
++from errors import (
++    ProviderError,
++    SymbolNotFoundError,
++    UpstreamBusyError,
++    UpstreamRateLimitError,
++    UpstreamTimeoutError,
+ )
+-from errors import ProviderError, SymbolNotFoundError, UpstreamRateLimitError
+ from providers import finnhub
+ 
+ __all__ = [
+@@ -40,58 +59,276 @@ def _normalize(symbol: str) -> str:
+     return symbol.upper().strip()
+ 
+ 
++# ---------------------------------------------------------------------------
++# Bounded, coalesced upstream calls
++#
++# Why this exists: a yfinance call that never returns used to pin a request
++# thread forever. Python cannot kill a running thread, so a deadline alone does
++# NOT cancel the underlying network call. The design therefore has three parts:
++#   1. yfinance is given its own network timeout, so the HTTP call really ends.
++#   2. Calls run on a small fixed pool and a request thread only waits up to a
++#      deadline, so a slow call can no longer hang a request.
++#   3. A semaphore caps calls that are running *or still finishing after their
++#      caller gave up*. When it is full we fail fast (UpstreamBusyError)
++#      instead of queueing more, so orphaned work cannot pile up.
++# Identical concurrent calls share one in-flight Future (request coalescing),
++# including a call whose first caller already timed out.
++# ---------------------------------------------------------------------------
++
++_yf_executor = ThreadPoolExecutor(max_workers=YF_MAX_WORKERS, thread_name_prefix="yf")
++_yf_slots = threading.BoundedSemaphore(YF_MAX_PENDING)
++_inflight: dict[str, Future] = {}
++_inflight_lock = threading.Lock()
++
++
++def _release_slot(key: str, fut: Future) -> None:
++    with _inflight_lock:
++        if _inflight.get(key) is fut:
++            del _inflight[key]
++    _yf_slots.release()
++
++
++def _run_bounded(key: str, fn, deadline: float):
++    """
++    Run fn() on the yfinance pool, sharing any identical in-flight call.
++
++    Raises UpstreamTimeoutError if no result within `deadline` seconds (the
++    call itself may keep running and will still populate caches when done),
++    or UpstreamBusyError if the pool is saturated.
++    """
++    with _inflight_lock:
++        fut = _inflight.get(key)
++        if fut is None:
++            if not _yf_slots.acquire(blocking=False):
++                raise UpstreamBusyError(
++                    "Market data requests are backed up. Please try again shortly."
++                )
++            try:
++                fut = _yf_executor.submit(fn)
++            except Exception:
++                _yf_slots.release()
++                raise
++            _inflight[key] = fut
++            owner = True
++        else:
++            owner = False
++    if owner:
++        # Registered after releasing the lock: the callback takes it itself.
++        fut.add_done_callback(lambda f, k=key: _release_slot(k, f))
++
++    try:
++        return fut.result(timeout=deadline)
++    except FutureTimeout:
++        raise UpstreamTimeoutError(
++            "Market data provider did not respond in time. Please try again."
++        ) from None
++
++
++# Brief memory of recent upstream failures: (expires_at, exception class, message).
++_failures: dict[str, tuple[float, type, str]] = {}
++_failures_lock = threading.Lock()
++
++
++def _remember_failure(key: str, exc: Exception, ttl: float = FAILURE_CACHE_TTL_SECONDS) -> None:
++    # "Busy" is our own capacity limit, not evidence the provider is unhealthy;
++    # remembering it would keep rejecting a key long after capacity frees up.
++    if ttl <= 0 or isinstance(exc, UpstreamBusyError):
++        return
++    with _failures_lock:
++        if len(_failures) > 500:  # keep the map bounded
++            now = time.time()
++            for k in [k for k, v in _failures.items() if v[0] <= now]:
++                del _failures[k]
++        _failures[key] = (time.time() + ttl, type(exc), str(exc))
++
++
++def _recent_failure(key: str) -> Exception | None:
++    with _failures_lock:
++        entry = _failures.get(key)
++        if entry is None:
++            return None
++        if entry[0] <= time.time():
++            del _failures[key]
++            return None
++        return entry[1](entry[2])
++
++
++def _clear_failure(key: str) -> None:
++    with _failures_lock:
++        _failures.pop(key, None)
++
++
++def _is_upstream_failure(exc: Exception) -> bool:
++    return isinstance(exc, (ProviderError, UpstreamRateLimitError, YFRateLimitError))
++
++
++def _normalize_upstream_error(exc: Exception) -> Exception:
++    if isinstance(exc, YFRateLimitError):
++        return UpstreamRateLimitError(
++            "Yahoo Finance is rate limiting requests. Please try again in a minute."
++        )
++    return exc
++
++
++class _Coalescer:
++    """
++    Share one in-progress computation between concurrent callers.
++
++    The first caller (leader) runs the producer inline; followers wait for its
++    result up to `deadline`. Used for work that is already bounded internally
++    (Finnhub HTTP calls with their own timeout).
++    """
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self._pending: dict[str, Future] = {}
++
++    def run(self, key: str, producer, deadline: float):
++        with self._lock:
++            fut = self._pending.get(key)
++            leader = fut is None
++            if leader:
++                fut = Future()
++                self._pending[key] = fut
++        if not leader:
++            try:
++                return fut.result(timeout=deadline)
++            except FutureTimeout:
++                raise UpstreamTimeoutError(
++                    "Market data provider did not respond in time. Please try again."
++                ) from None
++        try:
++            result = producer()
++        except BaseException as exc:
++            fut.set_exception(exc)
++            raise
++        else:
++            fut.set_result(result)
++            return result
++        finally:
++            with self._lock:
++                self._pending.pop(key, None)
++
++
++_quote_flight = _Coalescer()
++
++
+ # ---------------------------------------------------------------------------
+ # Historical candles (yfinance)
+ # ---------------------------------------------------------------------------
+ 
++_NETWORK_ERROR_HINTS = (
++    "failed to perform", "could not resolve", "timed out", "timeout",
++    "connection", "ssl", "curl:",
++)
++
++
++def _tag(df: pd.DataFrame, *, stale: bool, fetched_at: float | None) -> pd.DataFrame:
++    """Attach provenance to a frame (df.attrs survives .copy() and pickling)."""
++    out = df.copy()
++    out.attrs = {**df.attrs, "stale": stale}
++    if fetched_at is not None:
++        out.attrs["fetched_at"] = fetched_at
++    return out
++
++
++def _fetch_history(symbol: str, period: str, interval: str, min_rows: int, cache_key: str, use_cache: bool):
++    """Runs on a worker thread. Validates and caches, so a late result is not wasted."""
++    try:
++        data = yf.Ticker(symbol).history(
++            period=period, interval=interval, timeout=YF_NETWORK_TIMEOUT_SECONDS
++        )
++    except (YFRateLimitError, ValueError):
++        raise
++    except Exception as exc:
++        # Network failures (DNS, connect, timeout, TLS) and yfinance internals
++        # are an upstream problem, not a bad symbol: report them as such so the
++        # stale-cache fallback and failure memory apply.
++        raise ProviderError(
++            f"Could not reach the market data provider for '{symbol}' ({type(exc).__name__}). "
++            "Please try again."
++        ) from exc
++    if data.empty:
++        # yfinance swallows some errors and returns an empty frame. Tell a
++        # network failure apart from an unknown symbol using its error log.
++        last_error = str(getattr(yf_shared, "_ERRORS", {}).get(symbol, "")).lower()
++        if any(k in last_error for k in _NETWORK_ERROR_HINTS):
++            raise ProviderError(
++                f"Could not reach the market data provider for '{symbol}'. Please try again."
++            )
++        raise SymbolNotFoundError(f"No data found for symbol '{symbol}'.")
++    if len(data) < min_rows:
++        raise ValueError(
++            f"Insufficient data for '{symbol}': need at least {min_rows} rows, "
++            f"got {len(data)}."
++        )
++    data.attrs = {"stale": False, "fetched_at": time.time()}
++    if use_cache:
++        _data_cache.set(cache_key, data.copy())
++    return data
++
++
+ def download_stock_data(
+     symbol: str,
+     period: str = "1y",
+     interval: str = "1d",
+     use_cache: bool = True,
+     min_rows: int = MIN_HISTORY_ROWS,
++    deadline: float | None = None,
+ ) -> pd.DataFrame:
+     """
+     Download historical OHLCV data using yfinance.
+ 
+-    If Yahoo rate-limits the request, the most recent cached copy (even if
+-    expired) is returned instead of failing.
++    Order: fresh cache -> (recent failure? stale cache or error) -> bounded,
++    coalesced yfinance call -> on failure, stale cache.
++
++    The returned frame carries provenance in `df.attrs`:
++    `stale` (True when an expired cached copy is served because the provider
++    failed) and `fetched_at` (epoch seconds when the data was downloaded).
+ 
+     Raises:
+-        ValueError: If no data is returned or row count is insufficient.
+-        UpstreamRateLimitError: If rate-limited and no cached copy exists.
++        ValueError / SymbolNotFoundError: no data or too few rows.
++        UpstreamRateLimitError / UpstreamTimeoutError / UpstreamBusyError /
++        ProviderError: upstream failed and no cached copy exists.
+     """
+     symbol = _normalize(symbol)
+     cache_key = f"{symbol}:{period}:{interval}"
++    fail_key = f"hist:{cache_key}"
+     if use_cache:
+         cached = _data_cache.get(cache_key)
+         if cached is not None:
+-            return cached.copy()
++            return _tag(cached, stale=False, fetched_at=cached.attrs.get("fetched_at"))
+ 
+-    try:
+-        data = yf.Ticker(symbol).history(period=period, interval=interval)
+-    except YFRateLimitError as exc:
+-        stale = _data_cache.get_stale(cache_key)
++    def serve_stale_or(exc: Exception):
++        stale = _data_cache.get_stale(cache_key) if use_cache else None
+         if stale is not None:
+-            print(f"[data] Rate limited for {cache_key}; serving stale cache.")
+-            return stale.copy()
+-        raise UpstreamRateLimitError(
+-            "Yahoo Finance is rate limiting requests. Please try again in a minute."
+-        ) from exc
++            print(f"[data] {type(exc).__name__} for {cache_key}; serving stale cache.")
++            return _tag(stale, stale=True, fetched_at=stale.attrs.get("fetched_at"))
++        raise exc
+ 
+-    if data.empty:
+-        raise SymbolNotFoundError(f"No data found for symbol '{symbol}'.")
++    recent = _recent_failure(fail_key)
++    if recent is not None:
++        return serve_stale_or(recent)
+ 
+-    if len(data) < min_rows:
+-        raise ValueError(
+-            f"Insufficient data for '{symbol}': need at least {min_rows} rows, "
+-            f"got {len(data)}."
++    effective_deadline = YF_DEADLINE_SECONDS if deadline is None else deadline
++    try:
++        data = _run_bounded(
++            f"hist:{cache_key}:{min_rows}:{int(use_cache)}",
++            lambda: _fetch_history(symbol, period, interval, min_rows, cache_key, use_cache),
++            effective_deadline,
+         )
++    except Exception as exc:
++        if not _is_upstream_failure(exc):
++            raise  # not-found / insufficient rows: genuine answer, don't mask it
++        exc = _normalize_upstream_error(exc)
++        # A caller that chose a short deadline for an optional lookup timing
++        # out says nothing about provider health; don't poison the key for others.
++        if not (isinstance(exc, UpstreamTimeoutError) and deadline is not None):
++            _remember_failure(fail_key, exc)
++        return serve_stale_or(exc)
+ 
+-    if use_cache:
+-        _data_cache.set(cache_key, data.copy())
+-
+-    return data
++    _clear_failure(fail_key)
++    return _tag(data, stale=False, fetched_at=data.attrs.get("fetched_at"))
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -112,78 +349,143 @@ def _quote_from_yfinance(symbol: str) -> dict:
+         "change": price - prev_close if prev_close else None,
+         "change_percent": (price - prev_close) / prev_close * 100 if prev_close else None,
+         "volume": int(latest["Volume"]),
++        # Provenance of the candles: they may be an expired cached copy.
++        "stale": bool(data.attrs.get("stale", False)),
++        "fetched_at": data.attrs.get("fetched_at"),
+     }
+ 
+ 
+ def _volume_from_yfinance(symbol: str) -> int | None:
+-    """Finnhub's free quote has no volume; borrow it from cached daily candles."""
++    """
++    Best-effort volume for Finnhub quotes (its free quote has none).
++
++    Uses a short deadline and never raises. Daily candles are cached, so this
++    is at most one Yahoo call per symbol per cache TTL, and if it is slow the
++    call keeps running in the background and fills the cache for next time.
++    """
+     try:
+-        data = download_stock_data(symbol, period="5d", interval="1d", min_rows=1)
++        data = download_stock_data(
++            symbol, period="5d", interval="1d", min_rows=1,
++            deadline=BEST_EFFORT_DEADLINE_SECONDS,
++        )
+         return int(data["Volume"].iloc[-1])
+     except Exception:
+         return None
+ 
+ 
++def _fetch_quote(symbol: str) -> dict:
++    if finnhub.is_configured():
++        try:
++            quote = finnhub.get_quote(symbol)
++            quote["volume"] = _volume_from_yfinance(symbol)
++            quote["source"] = "finnhub"
++            quote["as_of"] = quote.get("timestamp")
++            return quote
++        except (ProviderError, UpstreamRateLimitError) as exc:
++            print(f"[data] Finnhub quote failed for {symbol} ({exc}); using yfinance.")
++    quote = {**_quote_from_yfinance(symbol), "source": "yfinance"}
++    quote["as_of"] = None
++    return quote
++
++
+ def get_quote(symbol: str) -> dict:
+     """
+     Return the latest quote for a symbol, tagged with its `source`.
+ 
+     Order: fresh cache -> Finnhub -> yfinance -> stale cache.
++    Every quote carries `fetched_at` (epoch seconds) and `stale`. `stale` is
++    True only when an expired cached quote is served because providers failed.
+     """
+     symbol = _normalize(symbol)
+     cached = _quote_cache.get(symbol)
+     if cached is not None:
+-        return cached
++        return {**cached, "stale": False}
+ 
+-    try:
+-        if finnhub.is_configured():
+-            try:
+-                quote = finnhub.get_quote(symbol)
+-                quote["volume"] = _volume_from_yfinance(symbol)
+-                quote["source"] = "finnhub"
+-            except (ProviderError, UpstreamRateLimitError) as exc:
+-                print(f"[data] Finnhub quote failed for {symbol} ({exc}); using yfinance.")
+-                quote = {**_quote_from_yfinance(symbol), "source": "yfinance"}
+-        else:
+-            quote = {**_quote_from_yfinance(symbol), "source": "yfinance"}
+-    except UpstreamRateLimitError:
++    fail_key = f"quote:{symbol}"
++
++    def serve_stale_or(exc: Exception):
+         stale = _quote_cache.get_stale(symbol)
+         if stale is not None:
+-            return stale
+-        raise
++            print(f"[data] {type(exc).__name__} for quote {symbol}; serving stale quote.")
++            return {**stale, "stale": True}
++        raise exc
++
++    recent = _recent_failure(fail_key)
++    if recent is not None:
++        return serve_stale_or(recent)
+ 
++    try:
++        quote = _quote_flight.run(
++            symbol, lambda: _fetch_quote(symbol), YF_DEADLINE_SECONDS + 10
++        )
++    except Exception as exc:
++        if not _is_upstream_failure(exc):
++            raise
++        exc = _normalize_upstream_error(exc)
++        _remember_failure(fail_key, exc)
++        return serve_stale_or(exc)
++
++    quote = {**quote, "fetched_at": quote.get("fetched_at") or time.time()}
++    if quote.get("stale"):
++        # Built from an expired cached copy: report it as such and do not
++        # cache it as fresh, which would extend its life.
++        return quote
+     _quote_cache.set(symbol, quote)
+-    return quote
++    _clear_failure(fail_key)
++    return {**quote, "stale": False}
+ 
+ 
+ # ---------------------------------------------------------------------------
+ # Company name
+ # ---------------------------------------------------------------------------
+ 
++def _lookup_company_name(symbol: str) -> str | None:
++    """Finnhub profile if configured, else yfinance .info. Runs bounded."""
++    if finnhub.is_configured():
++        # Finnhub is the name source when configured; never fall through to
++        # Yahoo's heavily rate-limited .info endpoint just for a display name.
++        return finnhub.get_company_profile(symbol).get("name")
++    return yf.Ticker(symbol).info.get("longName")
++
++
++def _name_worker(symbol: str) -> str | None:
++    name = _lookup_company_name(symbol)
++    if name:
++        _name_cache.set(symbol, name)
++    return name
++
++
+ def get_company_name(symbol: str) -> str:
+     """
+     Return the company's long name, cached for a long time.
+ 
+-    Uses Finnhub's profile endpoint when configured; otherwise yfinance's
+-    `.info` (Yahoo's most heavily rate-limited endpoint). Never raises:
+-    falls back to the ticker symbol.
++    Best-effort: waits only a few seconds and never raises. On a miss it
++    returns the ticker and remembers the failure briefly instead of retrying
++    on every request. A slow lookup keeps running and fills the cache when it
++    completes.
+     """
+     symbol = _normalize(symbol)
+     cached = _name_cache.get_stale(symbol)
+     if cached is not None:
+         return cached
+ 
+-    name = None
++    fail_key = f"name:{symbol}"
++    if _recent_failure(fail_key) is not None:
++        return symbol
++
+     try:
+-        if finnhub.is_configured():
+-            name = finnhub.get_company_profile(symbol).get("name")
+-        if not name:
+-            name = yf.Ticker(symbol).info.get("longName")
++        name = _run_bounded(
++            fail_key, lambda: _name_worker(symbol), BEST_EFFORT_DEADLINE_SECONDS
++        )
++    except UpstreamTimeoutError:
++        # Still running in the background; retry soon rather than in 5 minutes.
++        _remember_failure(fail_key, UpstreamTimeoutError("name timeout"), ttl=FAILURE_CACHE_TTL_SECONDS)
++        return symbol
++    except UpstreamBusyError:
++        return symbol  # local capacity limit; try again on the next request
+     except Exception as exc:  # rate limit, network, parsing...
+         print(f"[data] Could not fetch company name for {symbol}: {exc}")
+-
+-    if not name:
++        _remember_failure(fail_key, ProviderError(str(exc)), ttl=NAME_FAILURE_TTL_SECONDS)
+         return symbol
+ 
+-    _name_cache.set(symbol, name)
+-    return name
++    return name or symbol
+diff --git a/backend/errors.py b/backend/errors.py
+index 95778bd..fb83a06 100644
+--- a/backend/errors.py
++++ b/backend/errors.py
+@@ -11,3 +11,11 @@ class ProviderError(Exception):
+ 
+ class SymbolNotFoundError(ValueError):
+     """The requested ticker symbol does not exist at the provider."""
++
++
++class UpstreamTimeoutError(ProviderError):
++    """An upstream provider did not answer within our deadline."""
++
++
++class UpstreamBusyError(ProviderError):
++    """Too many upstream calls are already in flight; refusing to queue more."""
+diff --git a/backend/main.py b/backend/main.py
+index 05be524..6d4ea88 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -10,7 +10,7 @@ import traceback
+ import pandas as pd  # type: ignore
+ import requests  # type: ignore
+ import warnings
+-from fastapi import FastAPI, HTTPException  # type: ignore
++from fastapi import FastAPI, HTTPException, Response  # type: ignore
+ from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # type: ignore
+ from yfinance.exceptions import YFRateLimitError  # type: ignore
+@@ -25,7 +25,7 @@ from config import (
+     get_news_api_key,
+ )
+ from data import download_stock_data, get_company_name, get_quote
+-from errors import ProviderError, UpstreamRateLimitError
++from errors import ProviderError, UpstreamBusyError, UpstreamRateLimitError, UpstreamTimeoutError
+ from providers import finnhub
+ from features import prepare_features
+ from models.prediction import (
+@@ -53,6 +53,8 @@ app.add_middleware(
+     allow_credentials=False,
+     allow_methods=["GET"],
+     allow_headers=["*"],
++    # Lets the browser read data-freshness headers set by /history.
++    expose_headers=["X-Data-Stale", "X-Data-Fetched-At"],
+ )
+ 
+ _model_cache = TTLCache(ttl_seconds=MODEL_CACHE_TTL_SECONDS, max_size=50, name="model", max_stale_seconds=86400)
+@@ -72,6 +74,12 @@ def _log_and_raise(endpoint: str, exc: Exception) -> None:
+             detail="Market data provider is rate limiting requests. Please try again in a minute.",
+             headers={"Retry-After": "60"},
+         )
++    if isinstance(exc, UpstreamBusyError):
++        print(f"Upstream busy in {endpoint}: {exc}")
++        raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "5"})
++    if isinstance(exc, UpstreamTimeoutError):
++        print(f"Upstream timeout in {endpoint}: {exc}")
++        raise HTTPException(status_code=504, detail=str(exc))
+     if isinstance(exc, ProviderError):
+         print(f"Provider error in {endpoint}: {exc}")
+         raise HTTPException(status_code=502, detail=str(exc))
+@@ -176,6 +184,11 @@ def get_price(symbol: str):
+             "change": r(quote.get("change")),
+             "change_percent": r(quote.get("change_percent")),
+             "source": quote.get("source"),
++            # Freshness: when we obtained the data, the provider's own trade
++            # time if known, and whether this is an expired cached copy.
++            "fetched_at": quote.get("fetched_at"),
++            "as_of": quote.get("as_of"),
++            "stale": bool(quote.get("stale", False)),
+         }
+     except ValueError:
+         raise HTTPException(status_code=404, detail="Stock symbol not found")
+@@ -186,9 +199,13 @@ def get_price(symbol: str):
+ 
+ 
+ @app.get("/history")
+-def get_history(symbol: str, range: str = "1d", interval: str = "5m"):
++def get_history(response: Response, symbol: str, range: str = "1d", interval: str = "5m"):
+     try:
+         data = download_stock_data(symbol, period=range, interval=interval, min_rows=1)
++        # Body stays a plain list for compatibility; freshness goes in headers.
++        response.headers["X-Data-Stale"] = "true" if data.attrs.get("stale") else "false"
++        if data.attrs.get("fetched_at"):
++            response.headers["X-Data-Fetched-At"] = str(int(data.attrs["fetched_at"]))
+         data["SMA_10"] = data["Close"].rolling(window=10).mean()
+ 
+         window = 20 if interval.endswith("m") else 50 if interval.endswith("h") else 100
+diff --git a/backend/providers/finnhub.py b/backend/providers/finnhub.py
+index b2dbf44..c00f85d 100644
+--- a/backend/providers/finnhub.py
++++ b/backend/providers/finnhub.py
+@@ -11,11 +11,11 @@ from datetime import date, timedelta
+ 
+ import requests  # type: ignore
+ 
+-from config import get_finnhub_api_key
++from config import FINNHUB_TIMEOUT_SECONDS, get_finnhub_api_key
+ from errors import ProviderError, SymbolNotFoundError, UpstreamRateLimitError
+ 
+ BASE_URL = "https://finnhub.io/api/v1"
+-TIMEOUT_SECONDS = 8
++TIMEOUT_SECONDS = FINNHUB_TIMEOUT_SECONDS
+ 
+ # One shared session reuses TCP/TLS connections across requests.
+ _session = requests.Session()
+diff --git a/backend/tests/test_performance.py b/backend/tests/test_performance.py
+new file mode 100644
+index 0000000..2dbd69d
+--- /dev/null
++++ b/backend/tests/test_performance.py
+@@ -0,0 +1,370 @@
++"""
++Tests for the loading-performance work: bounded upstream calls, request
++coalescing, stale-cache fallback with provenance, brief failure caching and
++best-effort volume / company-name lookups.
++
++yfinance is replaced with a controllable fake; nothing touches the network.
++"""
++
++import threading
++import time
++from unittest.mock import patch
++
++import pandas as pd
++import pytest
++from fastapi.testclient import TestClient
++
++import data
++from errors import (
++    ProviderError,
++    SymbolNotFoundError,
++    UpstreamBusyError,
++    UpstreamRateLimitError,
++    UpstreamTimeoutError,
++)
++from main import app
++from providers import finnhub
++
++client = TestClient(app)
++
++
++def _frame(n: int = 60) -> pd.DataFrame:
++    idx = pd.date_range("2026-01-01", periods=n, freq="B", tz="UTC")
++    return pd.DataFrame(
++        {"Open": 1.0, "High": 2.0, "Low": 0.5, "Close": [10.0 + i for i in range(n)], "Volume": 1000},
++        index=idx,
++    )
++
++
++class FakeYF:
++    """Stands in for yf.Ticker. `gate` blocks history() until set."""
++
++    def __init__(self):
++        self.calls = 0
++        self.gate = threading.Event()
++        self.gate.set()  # not blocking by default
++        self.error: Exception | None = None
++        self.frame = _frame()
++        self.info_gate = threading.Event()
++        self.info_gate.set()
++        self.info_calls = 0
++        self._lock = threading.Lock()
++
++    def Ticker(self, symbol):  # noqa: N802 - mimics yf.Ticker
++        outer = self
++
++        class _T:
++            @property
++            def info(self_inner):
++                with outer._lock:
++                    outer.info_calls += 1
++                outer.info_gate.wait(10)
++                return {"longName": "Fake Corp"}
++
++            def history(self_inner, **kwargs):
++                with outer._lock:
++                    outer.calls += 1
++                outer.gate.wait(10)
++                if outer.error:
++                    raise outer.error
++                return outer.frame.copy()
++
++        return _T()
++
++
++@pytest.fixture
++def fake(monkeypatch):
++    f = FakeYF()
++    monkeypatch.setattr(data.yf, "Ticker", f.Ticker)
++    data._data_cache.clear()
++    data._quote_cache.clear()
++    data._name_cache.clear()
++    data._failures.clear()
++    monkeypatch.setattr(data, "YF_DEADLINE_SECONDS", 0.5)
++    monkeypatch.setattr(data, "BEST_EFFORT_DEADLINE_SECONDS", 0.2)
++    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
++    yield f
++    f.gate.set()
++    f.info_gate.set()
++    time.sleep(0.05)
++    data._data_cache.clear()
++    data._quote_cache.clear()
++    data._name_cache.clear()
++    data._failures.clear()
++
++
++# --- bounded calls ----------------------------------------------------------
++
++def test_hung_upstream_returns_within_deadline(fake):
++    fake.gate.clear()
++    start = time.time()
++    with pytest.raises(UpstreamTimeoutError):
++        data.download_stock_data("AAPL", period="1y", interval="1d")
++    assert time.time() - start < 2.0
++
++
++def test_timed_out_call_still_fills_cache_when_it_finishes(fake):
++    fake.gate.clear()
++    with pytest.raises(UpstreamTimeoutError):
++        data.download_stock_data("AAPL", period="1y", interval="1d")
++    fake.gate.set()
++    deadline = time.time() + 2
++    while time.time() < deadline and data._data_cache.get("AAPL:1y:1d") is None:
++        time.sleep(0.02)
++    assert data._data_cache.get("AAPL:1y:1d") is not None
++
++
++def test_timed_out_calls_cannot_accumulate(fake, monkeypatch):
++    monkeypatch.setattr(data, "_yf_slots", threading.BoundedSemaphore(2))
++    fake.gate.clear()
++    for sym in ("AAA", "BBB"):
++        with pytest.raises(UpstreamTimeoutError):
++            data.download_stock_data(sym, period="1y", interval="1d")
++    # Both timed-out calls are still running and still hold their slots.
++    with pytest.raises(UpstreamBusyError):
++        data.download_stock_data("CCC", period="1y", interval="1d")
++    # Once the stuck calls finish, capacity returns.
++    fake.gate.set()
++    deadline = time.time() + 2
++    while time.time() < deadline:
++        try:
++            data.download_stock_data("DDD", period="1y", interval="1d")
++            break
++        except UpstreamBusyError:
++            time.sleep(0.02)
++    else:
++        pytest.fail("slots were never released")
++
++
++# --- coalescing -------------------------------------------------------------
++
++def test_concurrent_identical_requests_share_one_upstream_call(fake, monkeypatch):
++    monkeypatch.setattr(data, "YF_DEADLINE_SECONDS", 3)
++    fake.gate.clear()
++    results, errors = [], []
++
++    def worker():
++        try:
++            results.append(data.download_stock_data("AAPL", period="1y", interval="1d"))
++        except Exception as exc:  # pragma: no cover
++            errors.append(exc)
++
++    threads = [threading.Thread(target=worker) for _ in range(6)]
++    for t in threads:
++        t.start()
++    time.sleep(0.2)
++    fake.gate.set()
++    for t in threads:
++        t.join(5)
++
++    assert not errors
++    assert len(results) == 6
++    assert fake.calls == 1
++
++
++def test_concurrent_quotes_share_one_fetch(fake, monkeypatch):
++    monkeypatch.setattr(data, "YF_DEADLINE_SECONDS", 3)
++    fake.gate.clear()
++    out = []
++    threads = [threading.Thread(target=lambda: out.append(data.get_quote("AAPL"))) for _ in range(4)]
++    for t in threads:
++        t.start()
++    time.sleep(0.2)
++    fake.gate.set()
++    for t in threads:
++        t.join(5)
++    assert len(out) == 4
++    assert fake.calls == 1
++
++
++# --- stale fallback and provenance -----------------------------------------
++
++def test_fresh_data_is_marked_not_stale_with_timestamp(fake):
++    df = data.download_stock_data("AAPL", period="1y", interval="1d")
++    assert df.attrs["stale"] is False
++    assert df.attrs["fetched_at"] == pytest.approx(time.time(), abs=5)
++
++
++def test_stale_cache_served_and_flagged_when_upstream_fails(fake):
++    seeded = _frame()
++    seeded.attrs = {"stale": False, "fetched_at": 1_700_000_000}
++    data._data_cache.set("AAPL:1y:1d", seeded)
++    fake.error = UpstreamRateLimitError("limited")
++    with patch.object(data._data_cache, "get", return_value=None):  # simulate expiry
++        df = data.download_stock_data("AAPL", period="1y", interval="1d")
++    assert df.attrs["stale"] is True
++    assert df.attrs["fetched_at"] == 1_700_000_000  # original time, not "now"
++
++
++def test_upstream_failure_without_cache_raises(fake):
++    fake.error = ProviderError("down")
++    with pytest.raises(ProviderError):
++        data.download_stock_data("AAPL", period="1y", interval="1d")
++
++
++def test_network_exception_becomes_provider_error_and_uses_stale_cache(fake):
++    fake.error = ConnectionError("Could not resolve host")
++    with pytest.raises(ProviderError) as info:
++        data.download_stock_data("AAPL", period="1y", interval="1d")
++    assert not isinstance(info.value, ValueError)  # not reported as "unknown symbol"
++    data._failures.clear()
++
++    seeded = _frame()
++    seeded.attrs = {"stale": False, "fetched_at": 1_700_000_000}
++    data._data_cache.set("AAPL:1y:1d", seeded)
++    with patch.object(data._data_cache, "get", return_value=None):  # simulate expiry
++        df = data.download_stock_data("AAPL", period="1y", interval="1d")
++    assert df.attrs["stale"] is True
++
++
++def test_empty_frame_after_network_failure_is_not_reported_as_unknown_symbol(fake, monkeypatch):
++    fake.frame = pd.DataFrame()
++    monkeypatch.setattr(data.yf_shared, "_ERRORS", {"AAPL": "Failed to perform, curl: (6) Could not resolve host"})
++    with pytest.raises(ProviderError) as info:
++        data.download_stock_data("AAPL", period="1y", interval="1d")
++    assert not isinstance(info.value, ValueError)
++
++
++def test_symbol_not_found_is_not_masked_by_stale_cache(fake):
++    fake.frame = pd.DataFrame()
++    with pytest.raises(SymbolNotFoundError):
++        data.download_stock_data("NOPE", period="1y", interval="1d")
++
++
++# --- brief failure caching --------------------------------------------------
++
++def test_failure_is_remembered_briefly(fake):
++    fake.error = ProviderError("down")
++    with pytest.raises(ProviderError):
++        data.download_stock_data("AAPL", period="1y", interval="1d")
++    calls_after_first = fake.calls
++    with pytest.raises(ProviderError):
++        data.download_stock_data("AAPL", period="1y", interval="1d")
++    assert fake.calls == calls_after_first  # second attempt never reached Yahoo
++
++
++def test_failure_memory_expires(fake):
++    fake.error = ProviderError("down")
++    with pytest.raises(ProviderError):
++        data.download_stock_data("AAPL", period="1y", interval="1d")
++    # Age the remembered failure past its TTL, then let the provider recover.
++    key = "hist:AAPL:1y:1d"
++    expires, kind, msg = data._failures[key]
++    data._failures[key] = (time.time() - 1, kind, msg)
++    fake.error = None
++    assert data.download_stock_data("AAPL", period="1y", interval="1d").attrs["stale"] is False
++
++
++# --- best-effort volume and company name -----------------------------------
++
++def test_finnhub_quote_not_blocked_by_slow_volume_lookup(fake, monkeypatch):
++    monkeypatch.setenv("FINNHUB_API_KEY", "k")
++    fh = {"price": 10.0, "open": 9, "high": 11, "low": 8, "previous_close": 9,
++          "change": 1, "change_percent": 11.1, "timestamp": 1_700_000_123}
++    fake.gate.clear()
++    start = time.time()
++    with patch.object(finnhub, "get_quote", return_value=fh):
++        quote = data.get_quote("AAPL")
++    assert time.time() - start < 1.0  # best-effort deadline, not the full 15s
++    assert quote["volume"] is None
++    assert quote["source"] == "finnhub"
++    assert quote["stale"] is False
++    assert quote["as_of"] == 1_700_000_123
++    assert quote["fetched_at"] == pytest.approx(time.time(), abs=5)
++
++
++def test_slow_volume_lookup_does_not_poison_history_for_others(fake, monkeypatch):
++    monkeypatch.setenv("FINNHUB_API_KEY", "k")
++    fh = {"price": 10.0, "open": 9, "high": 11, "low": 8, "previous_close": 9,
++          "change": 1, "change_percent": 11.1, "timestamp": 1}
++    fake.gate.clear()
++    with patch.object(finnhub, "get_quote", return_value=fh):
++        data.get_quote("AAPL")
++    assert data._recent_failure("hist:AAPL:5d:1d") is None
++
++
++def test_company_name_lookup_is_best_effort_and_not_retried(fake):
++    fake.info_gate.clear()
++    start = time.time()
++    assert data.get_company_name("AAPL") == "AAPL"  # falls back to ticker
++    assert time.time() - start < 1.0
++    first_calls = fake.info_calls
++    assert data.get_company_name("AAPL") == "AAPL"
++    assert fake.info_calls == first_calls  # not retried immediately
++
++
++def test_company_name_uses_finnhub_and_never_yahoo_info(fake, monkeypatch):
++    monkeypatch.setenv("FINNHUB_API_KEY", "k")
++    with patch.object(finnhub, "get_company_profile", return_value={"name": "Apple Inc"}):
++        assert data.get_company_name("AAPL") == "Apple Inc"
++    assert data.get_company_name("AAPL") == "Apple Inc"  # cached
++    assert fake.info_calls == 0
++
++
++def test_company_name_finnhub_miss_does_not_fall_back_to_yahoo(fake, monkeypatch):
++    monkeypatch.setenv("FINNHUB_API_KEY", "k")
++    with patch.object(finnhub, "get_company_profile", return_value={}):
++        assert data.get_company_name("AAPL") == "AAPL"
++    assert fake.info_calls == 0
++
++
++# --- quotes: stale handling -------------------------------------------------
++
++def test_stale_quote_is_flagged_and_keeps_original_timestamp(fake):
++    data._quote_cache.set("AAPL", {"price": 5.0, "open": 5, "high": 5, "low": 5, "source": "finnhub",
++                                   "fetched_at": 1_700_000_000})
++    fake.error = ProviderError("down")
++    with patch.object(data._quote_cache, "get", return_value=None):
++        quote = data.get_quote("AAPL")
++    assert quote["stale"] is True
++    assert quote["fetched_at"] == 1_700_000_000
++    assert quote["price"] == 5.0
++
++
++def test_quote_built_from_stale_candles_is_flagged_and_not_recached(fake):
++    seeded = _frame()
++    seeded.attrs = {"stale": False, "fetched_at": 1_700_000_000}
++    data._data_cache.set("AAPL:5d:1d", seeded)
++    fake.error = ProviderError("down")
++    with patch.object(data._data_cache, "get", return_value=None):
++        quote = data.get_quote("AAPL")
++    assert quote["stale"] is True
++    assert quote["fetched_at"] == 1_700_000_000
++    assert data._quote_cache.get("AAPL") is None  # staleness not laundered into "fresh"
++
++
++def test_quote_failure_without_cache_raises(fake):
++    fake.error = ProviderError("down")
++    with pytest.raises(ProviderError):
++        data.get_quote("AAPL")
++
++
++# --- HTTP layer -------------------------------------------------------------
++
++def test_price_endpoint_reports_freshness_fields():
++    q = {"price": 1.0, "open": 1, "high": 1, "low": 1, "source": "yfinance",
++         "fetched_at": 1_700_000_000, "stale": True, "as_of": None}
++    with patch("main.get_quote", return_value=q), patch("main.get_company_name", return_value="X"):
++        body = client.get("/price?symbol=AAPL").json()
++    assert body["stale"] is True
++    assert body["fetched_at"] == 1_700_000_000
++
++
++def test_history_endpoint_sets_freshness_headers():
++    df = _frame(30)
++    df.attrs = {"stale": True, "fetched_at": 1_700_000_000}
++    with patch("main.download_stock_data", return_value=df):
++        r = client.get("/history?symbol=AAPL&range=1y&interval=1d")
++    assert r.status_code == 200
++    assert isinstance(r.json(), list)
++    assert r.headers["x-data-stale"] == "true"
++    assert r.headers["x-data-fetched-at"] == "1700000000"
++
++
++@pytest.mark.parametrize(
++    "exc, status",
++    [(UpstreamTimeoutError("slow"), 504), (UpstreamBusyError("busy"), 503), (ProviderError("x"), 502)],
++)
++def test_upstream_errors_map_to_http_status(exc, status):
++    with patch("main.download_stock_data", side_effect=exc):
++        assert client.get("/history?symbol=AAPL").status_code == status
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index c142e06..75912fe 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1,5 +1,5 @@
+ import axios from "axios";
+-import { useState, useEffect, useCallback, useMemo } from "react";
++import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+ import { TrendingUp, TrendingDown, Activity, BarChart3, Star, HelpCircle, X, Search, Plus, Trash2, ExternalLink, Clock, Zap, Brain } from "lucide-react";
+ import { db } from "./firebase";
+ import { collection, getDocs, addDoc, deleteDoc, doc } from "firebase/firestore";
+@@ -8,6 +8,98 @@ import { Cell, Bar, BarChart, LineChart, Line, XAxis, YAxis, Tooltip, Responsive
+ // Get API URL from environment or use localhost as fallback
+ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+ 
++// ============================================
++// REQUEST HELPERS
++// ============================================
++
++// Every network call gets a timeout so a stalled server can never leave the UI
++// loading forever. Market-data calls retry once on a timeout, a network
++// failure or a 502/503/504 (typical while a free-tier server is waking up).
++const REQUEST_TIMEOUT_MS = 30000;
++const VALIDATE_TIMEOUT_MS = 15000;
++const NEWS_TIMEOUT_MS = 20000;
++const PREDICT_TIMEOUT_MS = 120000;
++const COMPARE_TIMEOUT_MS = 240000;
++const SLOW_LOAD_HINT_MS = 8000;
++const RETRY_DELAY_MS = 2000;
++const RETRY_STATUSES = new Set([502, 503, 504]);
++
++class ApiTimeoutError extends Error {
++  constructor() {
++    super("The request timed out. The market data server may be slow or waking up - please try again.");
++    this.name = "ApiTimeoutError";
++  }
++}
++
++const isAbortError = (err) => err?.name === "AbortError" || err?.code === "ERR_CANCELED";
++
++const abortableSleep = (ms, signal) =>
++  new Promise((resolve, reject) => {
++    if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
++    const onAbort = () => {
++      clearTimeout(timer);
++      reject(new DOMException("Aborted", "AbortError"));
++    };
++    const timer = setTimeout(() => {
++      signal?.removeEventListener("abort", onAbort);
++      resolve();
++    }, ms);
++    signal?.addEventListener("abort", onAbort, { once: true });
++  });
++
++const apiFetch = async (url, { timeoutMs = REQUEST_TIMEOUT_MS, signal, retry = true } = {}) => {
++  const attempt = async () => {
++    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
++    const ctrl = new AbortController();
++    let timedOut = false;
++    const onAbort = () => ctrl.abort();
++    signal?.addEventListener("abort", onAbort, { once: true });
++    const timer = setTimeout(() => {
++      timedOut = true;
++      ctrl.abort();
++    }, timeoutMs);
++    try {
++      return await fetch(url, { signal: ctrl.signal });
++    } catch (err) {
++      if (timedOut) throw new ApiTimeoutError();
++      throw err;
++    } finally {
++      clearTimeout(timer);
++      signal?.removeEventListener("abort", onAbort);
++    }
++  };
++
++  let res;
++  try {
++    res = await attempt();
++  } catch (err) {
++    if (!retry || !(err instanceof TypeError || err instanceof ApiTimeoutError)) throw err;
++    await abortableSleep(RETRY_DELAY_MS, signal);
++    return attempt();
++  }
++  if (retry && RETRY_STATUSES.has(res.status)) {
++    await abortableSleep(RETRY_DELAY_MS, signal);
++    return attempt();
++  }
++  return res;
++};
++
++// Freshness notice: when the data was obtained, and whether it is a cached copy.
++const formatDataTime = (epochSeconds) =>
++  new Date(epochSeconds * 1000).toLocaleString([], {
++    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
++  });
++
++const describeFreshness = (meta) => {
++  if (!meta) return null;
++  const when = formatDataTime((meta.stale ? meta.fetchedAt : meta.asOf || meta.fetchedAt) || Date.now() / 1000);
++  if (meta.priceStale || meta.chartStale) {
++    const what = meta.priceStale && meta.chartStale ? "price and chart" : meta.priceStale ? "price" : "chart";
++    return { stale: true, text: `Showing cached ${what} data from ${when} - the live data provider is unavailable.` };
++  }
++  return { stale: false, text: `Data as of ${when}` };
++};
++
+ // ============================================
+ // CUSTOM COMPONENTS
+ // ============================================
+@@ -218,6 +310,46 @@ function App() {
+   const [algorithmComparison, setAlgorithmComparison] = useState(null);
+   const [showComparison, setShowComparison] = useState(false);
+   const [showHelp, setShowHelp] = useState(false);
++  const [dataMeta, setDataMeta] = useState(null);
++  const [slowLoad, setSlowLoad] = useState(false);
++
++  // Request coordination: only one price+chart request runs at a time. A manual
++  // action cancels whatever is in flight; the automatic refresh yields instead.
++  const activeCtrlRef = useRef(null);     // price + chart request currently in flight
++  const secondaryCtrlRef = useRef(null);  // news + recommended algorithm (non-blocking)
++  const searchIdRef = useRef(0);          // bumps on each manual search
++  const validatingRef = useRef(false);    // watchlist symbol validation in flight
++  const addInputRef = useRef(null);
++
++  const beginPrimary = ({ newSearch = false } = {}) => {
++    activeCtrlRef.current?.abort();
++    if (newSearch) {
++      secondaryCtrlRef.current?.abort();
++      searchIdRef.current += 1;
++    }
++    const ctrl = new AbortController();
++    activeCtrlRef.current = ctrl;
++    return { id: searchIdRef.current, ctrl };
++  };
++  const endPrimary = (ctrl) => {
++    if (activeCtrlRef.current === ctrl) activeCtrlRef.current = null;
++  };
++
++  // Cancel anything in flight when the page unmounts.
++  useEffect(() => () => {
++    activeCtrlRef.current?.abort();
++    secondaryCtrlRef.current?.abort();
++  }, []);
++
++  // After a while, tell the user the wait is unusual instead of looking frozen.
++  useEffect(() => {
++    if (!loading) {
++      setSlowLoad(false);
++      return undefined;
++    }
++    const t = setTimeout(() => setSlowLoad(true), SLOW_LOAD_HINT_MS);
++    return () => clearTimeout(t);
++  }, [loading]);
+ 
+   // Fetch watchlist
+   const fetchWatchlist = async () => {
+@@ -246,20 +378,57 @@ function App() {
+     }
+   };
+ 
++  // Validate (only if needed) and add a typed symbol. Skips the network entirely
++  // for symbols already in the watchlist or already loaded on the dashboard.
++  const handleAddSymbol = async (rawSymbol, inputEl) => {
++    const sym = rawSymbol.trim().toUpperCase();
++    if (!sym || validatingRef.current) return;
++    if (watchlist.some(item => item.symbol === sym)) {
++      setPopupMessage("Symbol already in watchlist!");
++      setShowPopup(true);
++      return;
++    }
++
++    validatingRef.current = true;
++    try {
++      // A symbol already loaded on the dashboard was validated by that load.
++      if (data?.symbol !== sym) {
++        const response = await apiFetch(`${API_URL}/price?symbol=${encodeURIComponent(sym)}`, {
++          timeoutMs: VALIDATE_TIMEOUT_MS,
++          retry: false,
++        });
++        if (!response.ok) {
++          setPopupMessage(response.status === 404 ? "Invalid stock symbol" : "Could not validate the symbol right now. Please try again.");
++          setShowPopup(true);
++          return;
++        }
++      }
++      await addToWatchlist(sym);
++      if (inputEl) inputEl.value = "";
++    } catch {
++      setPopupMessage("Error validating symbol");
++      setShowPopup(true);
++    } finally {
++      validatingRef.current = false;
++    }
++  };
++
+   // Remove from watchlist
+   const removeFromWatchlist = async (id) => {
+     await deleteDoc(doc(db, "watchlist", id));
+     fetchWatchlist();
+   };
+ 
+-  // Fetch stock data
+-  const fetchStock = useCallback(async (symbolOverride = symbol, selectedRange = range.value, selectedInterval = range.interval) => {
++  // Fetch price + chart. Never throws: resolves to "ok", "error" (message is
++  // stored in `error`) or "aborted" (superseded by a newer request).
++  const fetchStock = useCallback(async (symbolOverride = symbol, selectedRange = range.value, selectedInterval = range.interval, signal) => {
+     try {
+       setError("");
++      const sym = encodeURIComponent(symbolOverride);
+ 
+       const [priceRes, chartRes] = await Promise.all([
+-        fetch(`${API_URL}/price?symbol=${symbolOverride}`),
+-        fetch(`${API_URL}/history?symbol=${symbolOverride}&range=${selectedRange}&interval=${selectedInterval}`)
++        apiFetch(`${API_URL}/price?symbol=${sym}`, { signal }),
++        apiFetch(`${API_URL}/history?symbol=${sym}&range=${selectedRange}&interval=${selectedInterval}`, { signal })
+       ]);
+ 
+       const toApiError = async (res, fallback) => {
+@@ -281,9 +450,25 @@ function App() {
+ 
+       const newPrice = await priceRes.json();
+       const newChart = await chartRes.json();
++      if (signal?.aborted) return "aborted";
++
++      // Freshness: is any of this an expired cached copy, and from when?
++      const priceStale = Boolean(newPrice.stale);
++      const chartStale = chartRes.headers.get("x-data-stale") === "true";
++      const chartFetched = Number(chartRes.headers.get("x-data-fetched-at")) || null;
++      const staleTimes = [priceStale && newPrice.fetched_at, chartStale && chartFetched].filter(Boolean);
++      setDataMeta({
++        priceStale,
++        chartStale,
++        stale: priceStale || chartStale,
++        asOf: newPrice.as_of || null,
++        fetchedAt: staleTimes.length ? Math.min(...staleTimes) : (newPrice.fetched_at || chartFetched),
++      });
+ 
+       setData(prevData => {
+-        if (!prevData || prevData.price !== newPrice.price || prevData.volume !== newPrice.volume) {
++        if (!prevData || prevData.symbol !== newPrice.symbol || prevData.price !== newPrice.price ||
++          prevData.volume !== newPrice.volume || prevData.stale !== newPrice.stale ||
++          prevData.fetched_at !== newPrice.fetched_at || prevData.company !== newPrice.company) {
+           return newPrice;
+         }
+         return prevData;
+@@ -297,71 +482,121 @@ function App() {
+         return prevChart;
+       });
+ 
+-      setLastUpdate(new Date().toLocaleTimeString());
++      const shownAt = newPrice.fetched_at ? new Date(newPrice.fetched_at * 1000) : new Date();
++      setLastUpdate(shownAt.toLocaleTimeString() + (priceStale || chartStale ? " (cached)" : ""));
++      return "ok";
+     } catch (err) {
+-      if (err.name === 'TypeError' && err.message.includes('fetch')) {
++      if (isAbortError(err) || signal?.aborted) return "aborted";
++      if (err.name === 'TypeError') {
+         setError(`Cannot connect to backend. Please check if the server is running.`);
+       } else {
+         setError(err.message || "Failed to fetch stock data");
+       }
++      return "error";
+     }
+   }, [symbol, range.value, range.interval]);
+ 
+-  // Search handler
+-  const handleSearch = async () => {
+-    if (!symbol.trim()) {
++  // Recommended algorithm (secondary; failures are ignored).
++  const fetchRecommendedAlgorithm = useCallback(async (symbolOverride = symbol, signal) => {
++    try {
++      const response = await apiFetch(
++        `${API_URL}/evaluation/recommendation?symbol=${encodeURIComponent(symbolOverride)}`,
++        { signal, timeoutMs: NEWS_TIMEOUT_MS, retry: false }
++      );
++      if (!response.ok) return null;
++      const body = await response.json();
++      return body.recommended_algorithm || null;
++    } catch {
++      return null; // keep current selection if the recommendation endpoint is unavailable
++    }
++  }, [symbol]);
++
++  // News + recommendation load in the background, after the dashboard is shown.
++  const loadSecondary = useCallback(async (sym, searchId) => {
++    secondaryCtrlRef.current?.abort();
++    const ctrl = new AbortController();
++    secondaryCtrlRef.current = ctrl;
++
++    const newsPromise = axios
++      .get(`${API_URL}/news?symbol=${encodeURIComponent(sym)}`, { signal: ctrl.signal, timeout: NEWS_TIMEOUT_MS })
++      .then(res => res.data.news || [])
++      .catch(err => {
++        if (!isAbortError(err)) console.warn("News unavailable:", err.message);
++        return null;
++      });
++    const recPromise = fetchRecommendedAlgorithm(sym, ctrl.signal);
++
++    const [newsItems, recommended] = await Promise.all([newsPromise, recPromise]);
++    if (ctrl.signal.aborted || searchIdRef.current !== searchId) return; // superseded
++    setNews(newsItems || []);
++    if (recommended) {
++      setRecommendedAlgorithm(recommended);
++      setSelectedAlgorithm(recommended);
++    }
++  }, [fetchRecommendedAlgorithm]);
++
++  // Search handler. Shows the dashboard as soon as price + chart are ready.
++  // Pass a symbol to search for it directly (popular stocks, watchlist);
++  // `reset` clears the previous stock first.
++  const handleSearch = async (symbolOverride, { reset = false } = {}) => {
++    const direct = typeof symbolOverride === "string";
++    const sym = (direct ? symbolOverride : symbol).trim();
++    if (!sym) {
+       setData(null);
+       setChartData([]);
+       setError("Please enter a stock symbol.");
+       return;
+     }
+ 
+-    setLoading(true);
+-    setError("");
+-    try {
+-      await fetchStock(symbol, range.value, range.interval);
+-      await fetchRecommendedAlgorithm(symbol);
+-      const res = await axios.get(`${API_URL}/news?symbol=${symbol}`);
+-      setNews(res.data.news || []);
++    if (direct) setSymbol(sym);
++    if (reset) {
++      setData(null);
++      setChartData([]);
++      setNews([]);
+       setPredictions([]);
+       setShowPredictions(false);
+-    } catch (err) {
+-      const apiDetail = err.response?.data?.detail;
+-      const errorMessage = apiDetail || err.message || "Unknown error occurred";
++    }
+ 
+-      if (err.message && err.message.includes('Network Error')) {
+-        setPopupMessage(`Cannot connect to backend API.`);
+-      } else if (err.message && err.message.includes('404')) {
+-        setPopupMessage("Stock symbol not found. Please enter a valid symbol.");
+-      } else {
+-        setPopupMessage(`Error: ${errorMessage}`);
++    // A new search cancels any search or automatic refresh already in flight.
++    const { id, ctrl } = beginPrimary({ newSearch: true });
++    setLoading(true);
++    setError("");
++    let result = "error";
++    try {
++      result = await fetchStock(sym, range.value, range.interval, ctrl.signal);
++      if (searchIdRef.current !== id) return;
++      if (result === "ok") {
++        setPredictions([]);
++        setShowPredictions(false);
++      } else if (result === "error") {
++        setNews([]);
+       }
+-      setShowPopup(true);
+-      setError(errorMessage);
+-      setNews([]);
++    } finally {
++      endPrimary(ctrl);
++      if (searchIdRef.current === id) setLoading(false);
+     }
+-    setLoading(false);
++
++    if (result === "ok") loadSecondary(sym, id);
+   };
+ 
+-  // Fetch recommended algorithm for symbol
+-  const fetchRecommendedAlgorithm = useCallback(async (symbolOverride = symbol) => {
++  // Range buttons: refetch the displayed stock without the full-page spinner.
++  const handleRangeChange = async (value, interval) => {
++    setRange({ value, interval });
++    const { ctrl } = beginPrimary();
+     try {
+-      const response = await fetch(`${API_URL}/evaluation/recommendation?symbol=${symbolOverride}`);
+-      if (!response.ok) return;
+-      const data = await response.json();
+-      setRecommendedAlgorithm(data.recommended_algorithm);
+-      setSelectedAlgorithm(data.recommended_algorithm);
+-    } catch {
+-      // Keep current selection if recommendation endpoint is unavailable
++      await fetchStock(data?.symbol || symbol, value, interval, ctrl.signal);
++    } finally {
++      endPrimary(ctrl);
+     }
+-  }, [symbol]);
++  };
+ 
+   // Fetch predictions
+   const fetchPredictions = useCallback(async (symbolOverride = symbol, algorithm = selectedAlgorithm) => {
+     setPredictionLoading(true);
+     try {
+-      const response = await fetch(
+-        `${API_URL}/predict?symbol=${symbolOverride}&period=1y&interval=1d&steps=5&algorithm=${algorithm}`
++      const response = await apiFetch(
++        `${API_URL}/predict?symbol=${encodeURIComponent(symbolOverride)}&period=1y&interval=1d&steps=5&algorithm=${algorithm}`,
++        { timeoutMs: PREDICT_TIMEOUT_MS, retry: false }
+       );
+       if (!response.ok) {
+         const errorData = await response.json().catch(() => ({}));
+@@ -390,7 +625,10 @@ function App() {
+   // Fetch algorithm comparison
+   const fetchAlgorithmComparison = useCallback(async (symbolOverride = symbol) => {
+     try {
+-      const response = await fetch(`${API_URL}/predict/compare?symbol=${symbolOverride}&period=1y&interval=1d`);
++      const response = await apiFetch(
++        `${API_URL}/predict/compare?symbol=${encodeURIComponent(symbolOverride)}&period=1y&interval=1d`,
++        { timeoutMs: COMPARE_TIMEOUT_MS, retry: false }
++      );
+       if (!response.ok) throw new Error("Failed to fetch algorithm comparison");
+       const comparisonData = await response.json();
+       setAlgorithmComparison(comparisonData);
+@@ -403,19 +641,29 @@ function App() {
+     }
+   }, [symbol]);
+ 
+-  // Auto-refresh
++  // Auto-refresh the displayed stock. Skips a tick if any request is in flight.
++  const displayedSymbol = data?.symbol;
+   useEffect(() => {
+-    const intervalId = setInterval(() => {
+-      if (symbol) fetchStock(symbol, range.value, range.interval);
++    const intervalId = setInterval(async () => {
++      if (!displayedSymbol || activeCtrlRef.current) return;
++      const ctrl = new AbortController();
++      activeCtrlRef.current = ctrl;
++      try {
++        await fetchStock(displayedSymbol, range.value, range.interval, ctrl.signal);
++      } finally {
++        endPrimary(ctrl);
++      }
+     }, 600000);
+     return () => clearInterval(intervalId);
+-  }, [symbol, range, fetchStock]);
++  }, [displayedSymbol, range, fetchStock]);
+ 
+   // Load watchlist on mount
+   useEffect(() => {
+     fetchWatchlist();
+   }, []);
+ 
++  const freshness = useMemo(() => describeFreshness(dataMeta), [dataMeta]);
++
+   // Memoized anomaly data
+   const anomalyData = useMemo(() => chartData.filter(d => d.anomaly), [chartData]);
+ 
+@@ -506,10 +754,7 @@ function App() {
+                   {["AAPL", "MSFT", "GOOGL", "TSLA", "AMZN"].map(s => (
+                     <button
+                       key={s}
+-                      onClick={() => {
+-                        setSymbol(s);
+-                        setTimeout(() => handleSearch(), 100);
+-                      }}
++                      onClick={() => handleSearch(s)}
+                       className="px-3 py-1.5 text-xs font-mono bg-dark-700 text-gray-300 rounded-lg hover:bg-accent-cyan hover:text-dark-900 transition-all"
+                     >
+                       {s}
+@@ -567,7 +812,7 @@ function App() {
+                         className="input-field pl-12"
+                       />
+                     </div>
+-                    <button onClick={handleSearch} className="btn-primary flex items-center gap-2">
++                    <button onClick={() => handleSearch()} className="btn-primary flex items-center gap-2">
+                       <Search size={18} />
+                       Search
+                     </button>
+@@ -577,7 +822,7 @@ function App() {
+                 {/* Loading State */}
+                 {loading && (
+                   <div className="glass-card p-12">
+-                    <LoadingSpinner text="Fetching stock data..." />
++                    <LoadingSpinner text={slowLoad ? "Still loading - the server may be waking up. This can take up to a minute..." : "Fetching stock data..."} />
+                   </div>
+                 )}
+ 
+@@ -606,6 +851,11 @@ function App() {
+                               ${data.price}
+                             </span>
+                           </div>
++                          {freshness && (
++                            <p className={`text-xs mt-1 ${freshness.stale ? "text-chart-orange" : "text-gray-500"}`}>
++                              {freshness.text}
++                            </p>
++                          )}
+                         </div>
+ 
+                         <button
+@@ -683,10 +933,7 @@ function App() {
+                           key={value}
+                           label={label}
+                           active={range.value === value}
+-                          onClick={() => {
+-                            setRange({ value, interval });
+-                            fetchStock(symbol, value, interval);
+-                          }}
++                          onClick={() => handleRangeChange(value, interval)}
+                         />
+                       ))}
+                     </div>
+@@ -925,25 +1172,8 @@ function App() {
+                       <div key={item.id} className="watchlist-item">
+                         <button
+                           onClick={async () => {
+-                            setData(null);
+-                            setChartData([]);
+-                            setNews([]);
+-                            setError("");
+-                            setPredictions([]);
+-                            setShowPredictions(false);
+-                            setSymbol(item.symbol);
+-                            setLoading(true);
+-
+-                            try {
+-                              await fetchStock(item.symbol, range.value, range.interval);
+-                              const res = await axios.get(`${API_URL}/news?symbol=${item.symbol}`);
+-                              setNews(res.data.news || []);
+-                            } catch (err) {
+-                              setError("Failed to load stock data: " + err.message);
+-                            }
+-
+-                            setLoading(false);
+                             setViewMode("chart");
++                            await handleSearch(item.symbol, { reset: true });
+                           }}
+                           className="font-mono font-semibold text-accent-cyan hover:text-accent-cyan-light transition-colors"
+                         >
+@@ -969,45 +1199,13 @@ function App() {
+                     type="text"
+                     placeholder="Add symbol (e.g. NVDA)"
+                     className="input-field flex-1"
+-                    onKeyDown={async (e) => {
+-                      if (e.key === "Enter") {
+-                        const sym = e.target.value.trim().toUpperCase();
+-                        if (!sym) return;
+-                        try {
+-                          const response = await fetch(`${API_URL}/price?symbol=${sym}`);
+-                          if (response.ok) {
+-                            await addToWatchlist(sym);
+-                            e.target.value = "";
+-                          } else {
+-                            setPopupMessage("Invalid stock symbol");
+-                            setShowPopup(true);
+-                          }
+-                        } catch {
+-                          setPopupMessage("Error validating symbol");
+-                          setShowPopup(true);
+-                        }
+-                      }
++                    ref={addInputRef}
++                    onKeyDown={(e) => {
++                      if (e.key === "Enter") handleAddSymbol(e.target.value, e.target);
+                     }}
+                   />
+                   <button
+-                    onClick={async () => {
+-                      const input = document.querySelector('input[placeholder="Add symbol (e.g. NVDA)"]');
+-                      const sym = input.value.trim().toUpperCase();
+-                      if (!sym) return;
+-                      try {
+-                        const response = await fetch(`${API_URL}/price?symbol=${sym}`);
+-                        if (response.ok) {
+-                          await addToWatchlist(sym);
+-                          input.value = "";
+-                        } else {
+-                          setPopupMessage("Invalid stock symbol");
+-                          setShowPopup(true);
+-                        }
+-                      } catch {
+-                        setPopupMessage("Error validating symbol");
+-                        setShowPopup(true);
+-                      }
+-                    }}
++                    onClick={() => handleAddSymbol(addInputRef.current?.value || "", addInputRef.current)}
+                     className="btn-primary flex items-center gap-2"
+                   >
+                     <Plus size={18} />
